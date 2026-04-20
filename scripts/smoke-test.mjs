@@ -39,7 +39,7 @@ async function main() {
 
     const transport = new StdioClientTransport({
         command: process.execPath,
-        args: [path.join(projectRoot, "index.js")],
+        args: [path.join(projectRoot, "dist", "index.js")],
         cwd: projectRoot,
         env: {
             ...process.env,

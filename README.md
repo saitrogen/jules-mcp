@@ -2,6 +2,8 @@
 
 Model Context Protocol (MCP) server for the Jules REST API.
 
+Built using the high-level `McpServer` API (not deprecated low-level `Server`).
+
 ## What this gives you
 
 This MCP server exposes Jules as tools so your MCP client can:
@@ -30,6 +32,7 @@ You can copy `.env.example` and fill it in.
 
 After installing dependencies:
 
+- `npm run build`
 - `npm start`
 
 ## Smoke test (recommended)
@@ -45,6 +48,16 @@ What it validates:
 - live API check via `jules_list_sources` (if `JULES_API_KEY` is set)
 
 If successful, it prints `✅ Smoke test passed`.
+
+## Build output (`dist`)
+
+This project now follows npm-style packaging:
+
+- source entry: `index.js`
+- built runtime entry: `dist/index.js`
+- package `bin` points to `dist/index.js`
+
+That means it behaves like a published package layout, even when run from GitHub via `npx`.
 
 ## Use with MCP clients via npx (GitHub-hosted, no npm publish)
 
