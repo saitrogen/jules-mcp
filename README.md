@@ -80,7 +80,7 @@ Use GitHub as the package source directly.
   "mcpServers": {
     "jules": {
       "command": "npx",
-      "args": ["-y", "github:YOUR_GITHUB_USER/YOUR_REPO_NAME"],
+      "args": ["-y", "github:saitrogen/jules-mcp"],
       "env": {
         "JULES_API_KEY": "YOUR_JULES_API_KEY"
       }
