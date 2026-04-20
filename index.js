@@ -4,7 +4,38 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 const API_KEY = process.env.JULES_API_KEY;
-const BASE_URL = process.env.JULES_BASE_URL || "https://jules.googleapis.com/v1alpha";
+
+function getCliOptionValue(optionNames) {
+  const args = process.argv.slice(2);
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    for (const optionName of optionNames) {
+      if (arg === optionName) {
+        const next = args[i + 1];
+        if (typeof next === "string" && !next.startsWith("-")) {
+          return next;
+        }
+      }
+      if (arg.startsWith(`${optionName}=`)) {
+        return arg.slice(optionName.length + 1);
+      }
+    }
+  }
+  return undefined;
+}
+
+function resolveBaseUrl() {
+  const cliBaseUrl = getCliOptionValue(["--jules-base-url", "--base-url"]);
+  if (typeof cliBaseUrl === "string" && cliBaseUrl.trim()) {
+    return cliBaseUrl.trim();
+  }
+  if (typeof process.env.JULES_BASE_URL === "string" && process.env.JULES_BASE_URL.trim()) {
+    return process.env.JULES_BASE_URL.trim();
+  }
+  return "https://jules.googleapis.com/v1alpha";
+}
+
+const BASE_URL = resolveBaseUrl();
 
 function buildUrl(path, query) {
   const url = new URL(path.replace(/^\//, ""), `${BASE_URL.replace(/\/$/, "")}/`);
@@ -48,7 +79,11 @@ async function julesRequest({ method = "GET", path, query, body }) {
 
   if (!response.ok) {
     const message = parsed?.error?.message || parsed?.message || raw || `HTTP ${response.status}`;
-    throw new Error(`Jules API error (${response.status}): ${message}`);
+    const error = new Error(`Jules API error (${response.status}): ${message}`);
+    error.httpStatus = response.status;
+    error.apiStatus = parsed?.error?.status;
+    error.apiMessage = parsed?.error?.message || parsed?.message || undefined;
+    throw error;
   }
 
   return parsed;
@@ -67,6 +102,53 @@ function optionalTrimmed(value) {
   }
   const trimmed = value.trim();
   return trimmed ? trimmed : undefined;
+}
+
+function normalizeSourceForSessionCreation(source) {
+  const normalized = requireNonEmpty(source, "source");
+  if (normalized.startsWith("sources/")) {
+    return normalized;
+  }
+  if (normalized.startsWith("github/")) {
+    return `sources/${normalized}`;
+  }
+  return normalized;
+}
+
+function sourceIdPathCandidates(sourceId) {
+  const normalized = requireNonEmpty(sourceId, "sourceId");
+  const candidates = [];
+
+  const slashId = normalized.replace(/^sources\//, "");
+
+  candidates.push(`/sources/${encodeURIComponent(normalized)}`);
+  candidates.push(`/sources/${slashId}`);
+  candidates.push(`/sources/${encodeURIComponent(slashId)}`);
+
+  const seen = new Set();
+  return candidates.filter((candidate) => {
+    if (seen.has(candidate)) {
+      return false;
+    }
+    seen.add(candidate);
+    return true;
+  });
+}
+
+function withCanonicalSource(source) {
+  if (!source || typeof source !== "object") {
+    return source;
+  }
+
+  const canonicalSource = source?.name || (typeof source?.id === "string" ? `sources/${source.id}` : undefined);
+  if (!canonicalSource) {
+    return source;
+  }
+
+  return {
+    ...source,
+    canonicalSource,
+  };
 }
 
 function textResult(data) {
@@ -183,8 +265,8 @@ const TOOL_REFERENCE = {
         name: "sourceId",
         type: "string",
         required: true,
-        description: "Source identifier (e.g. github-myorg-myrepo).",
-        example: "github-myorg-myrepo",
+        description: "Source identifier. Accepts `github/org/repo` or full `sources/github/org/repo`.",
+        example: "github/myorg/myrepo",
       },
     ],
   },
@@ -202,15 +284,15 @@ const TOOL_REFERENCE = {
         name: "source",
         type: "string",
         required: true,
-        description: "Source resource name.",
+        description: "Source resource. Prefer `sources/github/org/repo` (or `github/org/repo`, auto-normalized).",
         example: "sources/github-myorg-myrepo",
       },
       {
         name: "startingBranch",
         type: "string",
         required: false,
-        description: "Branch to start work from.",
-        default: "repository default branch",
+        description: "Branch to start work from. Strongly recommended; some repos reject missing branch.",
+        default: "auto-retry fallback: main, then master",
         example: "main",
       },
       {
@@ -467,6 +549,8 @@ function buildSkillPayload({ toolName, compact, includeExamples }) {
     focus: "jules-tooling",
     description: "Tool and parameter guidance for agents interacting with Jules.",
     usageHints: [
+      "Use source.canonicalSource from jules_list_sources as the jules_create_session source value.",
+      "Pass startingBranch explicitly when possible for deterministic session creation.",
       "Use jules_list_sessions with compact=true for discovery.",
       "Use jules_get_session for one session detail.",
       "Enable includeOutputs only when reviewing final generated artifacts.",
@@ -544,7 +628,15 @@ server.registerTool(
         filter,
       },
     });
-    return textResult(result);
+
+    const sources = Array.isArray(result.sources)
+      ? result.sources.map((source) => withCanonicalSource(source))
+      : result.sources;
+
+    return textResult({
+      ...result,
+      sources,
+    });
   }
 );
 
@@ -558,10 +650,31 @@ server.registerTool(
   },
   async ({ sourceId }) => {
     const normalizedSourceId = requireNonEmpty(sourceId, "sourceId");
-    const result = await julesRequest({
-      path: `/sources/${encodeURIComponent(normalizedSourceId)}`,
-    });
-    return textResult(result);
+    const candidates = sourceIdPathCandidates(normalizedSourceId);
+
+    let lastError;
+    for (const path of candidates) {
+      try {
+        const result = await julesRequest({ path });
+        return textResult(withCanonicalSource(result));
+      } catch (error) {
+        lastError = error;
+        if (error?.httpStatus !== 404) {
+          break;
+        }
+      }
+    }
+
+    if (lastError?.httpStatus === 404) {
+      const fallbackHint = normalizedSourceId.startsWith("sources/")
+        ? normalizedSourceId.replace(/^sources\//, "")
+        : `sources/${normalizedSourceId}`;
+      throw new Error(
+        `Source not found: ${normalizedSourceId}. Try using the exact value from jules_list_sources.canonicalSource (example: ${fallbackHint}).`
+      );
+    }
+
+    throw lastError;
   }
 );
 
@@ -580,7 +693,7 @@ server.registerTool(
   },
   async ({ prompt, source, startingBranch, title, automationMode, requirePlanApproval }) => {
     const normalizedPrompt = requireNonEmpty(prompt, "prompt");
-    const normalizedSource = requireNonEmpty(source, "source");
+    const normalizedSource = normalizeSourceForSessionCreation(source);
 
     const body = {
       prompt: normalizedPrompt,
@@ -602,18 +715,54 @@ server.registerTool(
     if (typeof requirePlanApproval === "boolean") {
       body.requirePlanApproval = requirePlanApproval;
     }
-    if (normalizedStartingBranch) {
-      body.sourceContext.githubRepoContext = {
-        startingBranch: normalizedStartingBranch,
+    const tryCreateSession = async (branchName) => {
+      const payload = {
+        ...body,
+        sourceContext: {
+          ...body.sourceContext,
+        },
       };
+
+      if (branchName) {
+        payload.sourceContext.githubRepoContext = {
+          startingBranch: branchName,
+        };
+      }
+
+      return julesRequest({
+        method: "POST",
+        path: "/sessions",
+        body: payload,
+      });
+    };
+
+    const branchCandidates = normalizedStartingBranch
+      ? [normalizedStartingBranch]
+      : [undefined, "main", "master"];
+
+    let lastError;
+    for (const branchCandidate of branchCandidates) {
+      try {
+        const result = await tryCreateSession(branchCandidate);
+        return textResult(result);
+      } catch (error) {
+        lastError = error;
+        const isInvalidArgument = error?.httpStatus === 400 && error?.apiStatus === "INVALID_ARGUMENT";
+        if (!isInvalidArgument) {
+          break;
+        }
+      }
     }
 
-    const result = await julesRequest({
-      method: "POST",
-      path: "/sessions",
-      body,
-    });
-    return textResult(result);
+    if (lastError?.httpStatus === 400 && lastError?.apiStatus === "INVALID_ARGUMENT") {
+      throw new Error(
+        `Session creation failed with INVALID_ARGUMENT for source '${normalizedSource}'. `
+        + "This often means the branch is required for that repository. "
+        + "Please set startingBranch explicitly (for example: 'main' or 'master')."
+      );
+    }
+
+    throw lastError;
   }
 );
 

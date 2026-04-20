@@ -26,6 +26,14 @@ Set:
 - `JULES_API_KEY` (required)
 - `JULES_BASE_URL` (optional, defaults to `https://jules.googleapis.com/v1alpha`)
 
+If/when stable `v1` is available for your account, you can override with `JULES_BASE_URL=https://jules.googleapis.com/v1`.
+
+Base URL precedence is:
+
+1. CLI args in MCP client config (`--jules-base-url` or `--base-url`)
+2. `JULES_BASE_URL` environment variable
+3. default `https://jules.googleapis.com/v1alpha`
+
 You can copy `.env.example` and fill it in.
 
 ## Run locally
@@ -89,6 +97,28 @@ Use GitHub as the package source directly.
 }
 ```
 
+## Production-style base URL override in MCP config
+
+You can override base URL directly in MCP client `args` (without relying on `.env` files):
+
+```json
+{
+  "mcpServers": {
+    "jules": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "github:saitrogen/jules-mcp",
+        "--jules-base-url=https://jules.googleapis.com/v1alpha"
+      ],
+      "env": {
+        "JULES_API_KEY": "YOUR_JULES_API_KEY"
+      }
+    }
+  }
+}
+```
+
 ## Available tools
 
 - `jules_list_sources`
@@ -101,6 +131,18 @@ Use GitHub as the package source directly.
 - `jules_send_message`
 - `jules_approve_plan`
 - `jules_get_skill`
+
+## Session creation UX conventions (important)
+
+To reduce failed calls when creating sessions:
+
+- Use `jules_list_sources` and pass `sources[].canonicalSource` into `jules_create_session.source`.
+- `jules_create_session.source` accepts both:
+  - `sources/github/org/repo` (recommended)
+  - `github/org/repo` (auto-normalized by server)
+- Prefer passing `startingBranch` explicitly (`main`, `master`, or repo-specific branch).
+
+If `startingBranch` is omitted, the server now retries with sensible fallbacks (`main`, then `master`) before returning an actionable error.
 
 ## Efficient context controls (new)
 
