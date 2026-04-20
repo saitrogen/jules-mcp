@@ -1,0 +1,32 @@
+{
+  "name": "jules-mcp-server",
+  "version": "0.1.0",
+  "description": "MCP server for Jules REST API",
+  "type": "module",
+  "bin": {
+    "jules-mcp": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "scripts",
+    "README.md",
+    ".env.example"
+  ],
+  "scripts": {
+    "start": "node index.js",
+    "check": "node --check index.js",
+    "test:smoke": "node --env-file=.env scripts/smoke-test.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "jules",
+    "model-context-protocol"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  }
+}
