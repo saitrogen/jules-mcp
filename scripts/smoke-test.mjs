@@ -19,6 +19,7 @@ const expectedTools = new Set([
     "jules_list_activities",
     "jules_send_message",
     "jules_approve_plan",
+    "jules_get_skill",
 ]);
 
 function parseToolTextResult(toolResult) {

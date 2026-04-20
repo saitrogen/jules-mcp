@@ -100,3 +100,41 @@ Use GitHub as the package source directly.
 - `jules_list_activities`
 - `jules_send_message`
 - `jules_approve_plan`
+- `jules_get_skill`
+
+## Efficient context controls (new)
+
+For large sessions, use these optional params on:
+
+- `jules_list_sessions`
+- `jules_get_session`
+
+Parameters:
+
+- `compact` (boolean): returns a smaller summary payload.
+- `includePrompt` (boolean): include or omit `prompt` text.
+- `includeOutputs` (boolean): include or omit large `outputs` blocks.
+- `includeSourceContext` (boolean): include or omit source context.
+- `maxPromptChars` (number): truncate long prompts to a max length.
+
+Example strategy for efficiency:
+
+1. `jules_list_sessions` with `compact: true, includePrompt: false, includeOutputs: false, pageSize: 5`
+2. Pick one `sessionId`
+3. `jules_get_session` with only fields you need (e.g., `includeOutputs: true` only when reviewing a final patch)
+
+## Skill tool for new agents
+
+Use `jules_get_skill` to get tool + parameter guidance directly from the server.
+
+Parameters:
+
+- `toolName` (optional): return only one tool's details.
+- `compact` (optional): return purpose + required params only.
+- `includeExamples` (optional): include or omit example values.
+
+Common calls:
+
+- `{ "compact": true }`
+- `{ "toolName": "jules_create_session" }`
+- `{ "toolName": "jules_list_sessions", "includeExamples": false }`
