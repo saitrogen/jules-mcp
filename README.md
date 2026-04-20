@@ -144,6 +144,15 @@ To reduce failed calls when creating sessions:
 
 If `startingBranch` is omitted, the server now retries with sensible fallbacks (`main`, then `master`) before returning an actionable error.
 
+## Source discovery UX
+
+`jules_list_sources.filter` supports two modes:
+
+- **AIP expression** (server-side): e.g. `name=sources/github/myorg/myrepo`
+- **Simple substring** (local fallback): e.g. `jules-mcp`
+
+If server-side filtering is rejected as `INVALID_ARGUMENT`, the server automatically falls back to local substring matching and returns a warning plus matched sources.
+
 ## Efficient context controls (new)
 
 For large sessions, use these optional params on:
@@ -180,3 +189,113 @@ Common calls:
 - `{ "compact": true }`
 - `{ "toolName": "jules_create_session" }`
 - `{ "toolName": "jules_list_sessions", "includeExamples": false }`
+
+## Agent-Focused Workflows (v0.3.0+)
+
+This version extends Jules MCP with comprehensive agent-management capabilities. Agents can now handle complete development workflows without manual steps.
+
+### New Tools for Agents
+
+**Session Lifecycle Management:**
+- `jules_wait_for_session` - Poll until session reaches terminal state
+- `jules_get_session_state` - Quick state check (lightweight)
+- `jules_list_activities_filtered` - Activities with type filtering
+- `jules_get_session_output` - Extract PRs and files from completed sessions
+
+**Error Recovery & Observability:**
+- `jules_health_check` - Verify API connectivity before starting
+- `jules_describe_error` - Parse API errors into actionable guidance
+
+**Templates:**
+- `jules_build_session_prompt` - Pre-configured prompts for common tasks
+
+### Complete Workflow Example
+
+Create, wait, and extract outputs in one agent action:
+
+```javascript
+// 1. Health check
+const health = await callTool('jules_health_check');
+
+// 2. Create session
+const session = await callTool('jules_create_session', {
+  source: 'github/saitrogen/my-repo',
+  prompt: 'Add unit tests for auth module',
+  requirePlanApproval: true,
+});
+
+// 3. Approve plan
+await callTool('jules_approve_plan', {
+  sessionId: session.id,
+});
+
+// 4. Wait for completion
+const completed = await callTool('jules_wait_for_session', {
+  sessionId: session.id,
+  timeoutSeconds: 300,
+});
+
+// 5. Extract outputs
+const outputs = await callTool('jules_get_session_output', {
+  sessionId: session.id,
+  outputType: 'pullRequest',
+});
+
+console.log('PR created:', outputs.pullRequests[0].url);
+```
+
+### Best Practices for Agents
+
+**Session Creation**
+- Always start with `requirePlanApproval: true` to validate approach
+- Use `jules_build_session_prompt` for consistent templates
+- One task per session (atomicity)
+
+**Polling Strategy**
+- Use `timeoutSeconds=300` (5 min) for typical tasks
+- Increase to `600` (10 min) for large refactors
+- Use `pollIntervalMs=2000` (2 sec) for normal tasks, `5000` for quieter polling
+
+**Error Handling**
+- Call `jules_health_check` before creating sessions
+- Use `jules_describe_error` to parse failures
+- For `retryable: true` errors, implement exponential backoff
+- For `retryable: false` errors, fix input and retry
+
+**Data Extraction**
+- Always extract `outputs` before deleting sessions
+- Use `jules_get_session_output` to structure PR/file data
+- Check `state` field: only extract if `state === 'COMPLETED'`
+
+**Parallelization**
+- Create multiple independent sessions in parallel
+- Use separate polling loops per session
+- Batch cleanup operations
+
+### Troubleshooting
+
+| Error | Cause | Solution |
+|-------|-------|----------|
+| `Timeout waiting for session` | Task exceeds timeout | Increase `timeoutSeconds` or check session state manually |
+| `Invalid session ID format` | Bad session reference | Use `jules_list_sessions` to get valid IDs |
+| `Rate limited (429)` | API quota hit | Increase `pollIntervalMs` to 5-10 seconds |
+| `Unauthorized (401)` | Missing/invalid API key | Verify `JULES_API_KEY` environment variable |
+| `Source not found (404)` | Wrong repo format | Use `jules_list_sources` to find canonical source path |
+
+## Version History
+
+### v0.3.0 (Current)
+- ✅ Complete Jules API coverage (16 tools)
+- ✅ Session polling and state management
+- ✅ Activity filtering
+- ✅ Error description and recovery helpers
+- ✅ Session templates for common flows
+- ✅ Agent-focused workflows and best practices
+
+### v0.2.0
+- 10 core Jules API tools
+- Compact response modes
+- Skill guidance tool
+
+### v0.1.0
+- Initial release

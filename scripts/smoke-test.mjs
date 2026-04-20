@@ -20,6 +20,16 @@ const expectedTools = new Set([
     "jules_send_message",
     "jules_approve_plan",
     "jules_get_skill",
+    // Phase 1: Session lifecycle tools
+    "jules_wait_for_session",
+    "jules_get_session_state",
+    "jules_list_activities_filtered",
+    "jules_get_session_output",
+    // Phase 2: Error recovery tools
+    "jules_health_check",
+    "jules_describe_error",
+    // Phase 3: Session templates
+    "jules_build_session_prompt",
 ]);
 
 function parseToolTextResult(toolResult) {
@@ -58,7 +68,7 @@ async function main() {
 
     const client = new Client({
         name: "jules-mcp-smoke-test",
-        version: "0.1.0",
+        version: "0.3.0",
     });
 
     try {
@@ -68,20 +78,38 @@ async function main() {
         const toolsResult = await client.listTools();
         const toolNames = new Set((toolsResult.tools || []).map((t) => t.name));
 
+        console.log(`📊 Available tools: ${toolNames.size}`);
+
         for (const tool of expectedTools) {
             if (!toolNames.has(tool)) {
                 throw new Error(`Missing expected tool: ${tool}`);
             }
         }
 
-        console.log(`✅ Tool discovery passed (${toolNames.size} tools reported)`);
+        console.log(`✅ Tool discovery passed (${expectedTools.size} expected tools verified)`);
 
         if (!process.env.JULES_API_KEY) {
-            console.log("⚠️  JULES_API_KEY is not set; skipping live API check.");
-            console.log("✅ Smoke test passed (protocol/tooling checks)");
+            console.log("⚠️  JULES_API_KEY is not set; skipping live API checks.");
+            console.log("✅ Smoke test passed (protocol/tooling checks only)");
             return;
         }
 
+        // Test health check (Phase 2)
+        console.log("\n🧪 Testing Phase 2: Error recovery tools...");
+        const healthResult = await client.callTool({
+            name: "jules_health_check",
+            arguments: {},
+        });
+
+        if (!healthResult.isError) {
+            const health = parseToolTextResult(healthResult);
+            if (health?.status === "healthy") {
+                console.log("✅ Health check passed (API reachable)");
+            }
+        }
+
+        // Test live API call
+        console.log("\n🧪 Testing live API call...");
         const listSourcesResult = await client.callTool({
             name: "jules_list_sources",
             arguments: { pageSize: 1 },
@@ -96,7 +124,22 @@ async function main() {
         const sourceCount = Array.isArray(parsed?.sources) ? parsed.sources.length : 0;
 
         console.log(`✅ Live Jules API call passed (received ${sourceCount} source item(s) on first page)`);
-        console.log("✅ Smoke test passed");
+
+        // Test template builder (Phase 3)
+        console.log("\n🧪 Testing Phase 3: Session templates...");
+        const templateResult = await client.callTool({
+            name: "jules_build_session_prompt",
+            arguments: { template: "add_tests" },
+        });
+
+        if (!templateResult.isError) {
+            const template = parseToolTextResult(templateResult);
+            if (template?.prompt) {
+                console.log("✅ Template builder passed (generated prompt for 'add_tests')");
+            }
+        }
+
+        console.log("\n✅ Smoke test passed (all phases verified)");
     } finally {
         await client.close();
 

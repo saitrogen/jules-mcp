@@ -1,6 +1,6 @@
 {
   "name": "jules-mcp-server",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "MCP server for Jules REST API",
   "type": "module",
   "bin": {
