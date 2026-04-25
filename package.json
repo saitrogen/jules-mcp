@@ -8,6 +8,7 @@
   },
   "files": [
     "dist",
+    "lib",
     "scripts",
     "README.md",
     ".env.example"
@@ -15,13 +16,15 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "start": "node dist/index.js",
-    "check": "node --check index.js && node --check scripts/smoke-test.mjs && node --check scripts/build.mjs",
+    "start:http": "deno run --allow-net --allow-env --allow-read http.js",
+    "check": "node --check index.js && node --check lib/server.js && node --check scripts/smoke-test.mjs && node --check scripts/build.mjs",
     "test:smoke": "npm run build && node --env-file=.env scripts/smoke-test.mjs"
   },
   "keywords": [
     "mcp",
     "jules",
-    "model-context-protocol"
+    "model-context-protocol",
+    "perplexity"
   ],
   "license": "MIT",
   "engines": {
