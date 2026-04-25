@@ -1,0 +1,17 @@
+{
+  "name": "jules-mcp-http",
+  "version": "0.3.0",
+  "description": "Jules MCP server — HTTP entrypoint for Perplexity remote connector",
+  "tasks": {
+    "start": "deno run --allow-net --allow-env --allow-read http.js",
+    "dev": "deno run --allow-net --allow-env --allow-read --watch http.js"
+  },
+  "imports": {
+    "npm:@modelcontextprotocol/sdk@latest/": "npm:@modelcontextprotocol/sdk@latest/"
+  },
+  "lint": {
+    "rules": {
+      "exclude": ["no-explicit-any"]
+    }
+  }
+}
