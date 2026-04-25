@@ -1,8 +1,9 @@
 /**
  * build.mjs
  * Copies index.js and lib/server.js into dist/.
- * The dist/index.js references dist/../lib/server.js via a relative import,
- * so both files must be present in dist for the published npm package to work.
+ * The dist/index.js references dist/lib/server.js via a relative import
+ * (i.e., "./lib/server.js"), so both files must be present under dist/
+ * for the published npm package to work.
  */
 import { chmod, copyFile, mkdir } from "node:fs/promises";
 import path from "node:path";

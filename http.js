@@ -33,6 +33,17 @@ const CORS_HEADERS = {
 };
 
 /**
+ * Attach CORS headers to any Response, merging with existing headers.
+ */
+function withCors(response) {
+  const headers = new Headers(response.headers);
+  for (const [key, value] of Object.entries(CORS_HEADERS)) {
+    headers.set(key, value);
+  }
+  return new Response(response.body, { status: response.status, headers });
+}
+
+/**
  * Extract the Jules API key from the Authorization header.
  * Perplexity sends: Authorization: Bearer <key>
  */
@@ -68,25 +79,28 @@ async function handleMcp(request) {
       JSON.stringify({
         error: "Missing API key. Set Authorization: Bearer <your Jules API key> in the connector settings.",
       }),
-      { status: 401, headers: { "content-type": "application/json", ...CORS_HEADERS } }
+      {
+        status: 401,
+        headers: {
+          "content-type": "application/json",
+          // RFC 6750 §3 — tell clients which auth scheme is expected
+          "WWW-Authenticate": 'Bearer realm="jules-mcp", charset="UTF-8"',
+          ...CORS_HEADERS,
+        },
+      }
     );
   }
 
   const mcpServer = createServer(apiKey);
-  // sessionIdGenerator: undefined → stateless (no persistent session tracking)
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => crypto.randomUUID(),
   });
 
   try {
     await mcpServer.connect(transport);
+    // handleRequest returns a Response; ensure CORS headers are present on it.
     const response = await transport.handleRequest(request);
-    // Inject CORS headers into the MCP response
-    const corsed = new Response(response.body, {
-      status: response.status,
-      headers: { ...Object.fromEntries(response.headers.entries()), ...CORS_HEADERS },
-    });
-    return corsed;
+    return withCors(response);
   } finally {
     // Always clean up to release event listeners and avoid memory leaks.
     await mcpServer.close().catch(() => {});
