@@ -1,7 +1,8 @@
 /**
  * http.js — Deno Deploy HTTP entrypoint for the Perplexity remote MCP connector.
  *
- * Transport: MCP Streamable HTTP (POST /mcp) — the standard for remote connectors.
+ * Transport: MCP Streamable HTTP (POST /mcp + GET /mcp) — the standard for
+ * remote connectors. Perplexity probes with GET before sending POST.
  * Auth:      Expects the caller's Jules API key in the Authorization header:
  *              Authorization: Bearer <JULES_API_KEY>
  *            Perplexity injects this automatically when the user configures the
@@ -10,7 +11,8 @@
  * Deploy to Deno Deploy:
  *   1. Push this repo to GitHub.
  *   2. Go to https://dash.deno.com → New Project → link this repo.
- *   3. Entrypoint: http.js | Build command: deno cache http.js
+ *   3. Install command: deno install
+ *      Entrypoint: http.js
  *   4. No env vars needed — the Jules API key comes per-request from the
  *      Authorization header.
  *
@@ -19,24 +21,17 @@
  *   Auth: Bearer <your Jules API key>
  */
 
-// Use inline npm: specifiers — no import map needed, Deno resolves these
-// directly from the npm registry without requiring node_modules.
 import { StreamableHTTPServerTransport } from "npm:@modelcontextprotocol/sdk@1.12.1/server/streamableHttp.js";
 import { createServer } from "./lib/server.js";
 
 const PORT = parseInt(Deno.env.get("PORT") ?? "8000", 10);
 
-// CORS headers applied to every response from /mcp so browser-based
-// clients (and Perplexity's web frontend) can reach the endpoint.
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, Mcp-Session-Id",
 };
 
-/**
- * Attach CORS headers to any Response, merging with existing headers.
- */
 function withCors(response) {
   const headers = new Headers(response.headers);
   for (const [key, value] of Object.entries(CORS_HEADERS)) {
@@ -45,22 +40,18 @@ function withCors(response) {
   return new Response(response.body, { status: response.status, headers });
 }
 
-/**
- * Extract the Jules API key from the Authorization header.
- * Perplexity sends: Authorization: Bearer <key>
- */
 function extractApiKey(request) {
   const auth = request.headers.get("authorization") ?? "";
   if (auth.toLowerCase().startsWith("bearer ")) {
     const key = auth.slice(7).trim();
     if (key) return key;
   }
+  // Also check x-api-key header as fallback
+  const xApiKey = request.headers.get("x-api-key") ?? "";
+  if (xApiKey.trim()) return xApiKey.trim();
   return null;
 }
 
-/**
- * Health / root endpoint — lets Perplexity (and curl) verify the server is live.
- */
 function handleHealth() {
   return new Response(
     JSON.stringify({ status: "ok", server: "jules-mcp", version: "0.3.0" }),
@@ -69,10 +60,10 @@ function handleHealth() {
 }
 
 /**
- * Handle a single MCP Streamable HTTP request.
- *
- * A fresh McpServer is created per request (stateless). Jules holds all
- * session state; nothing is stored between requests on this server.
+ * Handle MCP requests — both POST (RPC calls) and GET (SSE stream / probe).
+ * Perplexity sends a GET first to verify the endpoint exists, then POSTs.
+ * DELETE is used by some clients to terminate sessions.
+ * All methods are forwarded to the StreamableHTTPServerTransport.
  */
 async function handleMcp(request) {
   const apiKey = extractApiKey(request);
@@ -85,7 +76,6 @@ async function handleMcp(request) {
         status: 401,
         headers: {
           "content-type": "application/json",
-          // RFC 6750 §3 — tell clients which auth scheme is expected
           "WWW-Authenticate": 'Bearer realm="jules-mcp", charset="UTF-8"',
           ...CORS_HEADERS,
         },
@@ -100,32 +90,26 @@ async function handleMcp(request) {
 
   try {
     await mcpServer.connect(transport);
-    // handleRequest returns a Response; ensure CORS headers are present on it.
     const response = await transport.handleRequest(request);
     return withCors(response);
   } finally {
-    // Always clean up to release event listeners and avoid memory leaks.
     await mcpServer.close().catch(() => {});
   }
 }
 
-/**
- * Main request router.
- */
 async function handleRequest(request) {
   const url = new URL(request.url);
 
-  // Health / root
   if (url.pathname === "/health" || url.pathname === "/") {
     return handleHealth();
   }
 
-  // MCP Streamable HTTP endpoint
   if (url.pathname === "/mcp") {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
-    if (request.method === "POST") {
+    // Forward GET, POST, DELETE all to the MCP transport
+    if (["GET", "POST", "DELETE"].includes(request.method)) {
       return await handleMcp(request);
     }
     return new Response(JSON.stringify({ error: "Method not allowed" }), {
