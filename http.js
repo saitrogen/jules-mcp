@@ -10,7 +10,7 @@
  * Deploy to Deno Deploy:
  *   1. Push this repo to GitHub.
  *   2. Go to https://dash.deno.com → New Project → link this repo.
- *   3. Set entrypoint to: http.js
+ *   3. Entrypoint: http.js | Build command: deno cache http.js
  *   4. No env vars needed — the Jules API key comes per-request from the
  *      Authorization header.
  *
@@ -19,6 +19,8 @@
  *   Auth: Bearer <your Jules API key>
  */
 
+// Use inline npm: specifiers — no import map needed, Deno resolves these
+// directly from the npm registry without requiring node_modules.
 import { StreamableHTTPServerTransport } from "npm:@modelcontextprotocol/sdk@1.12.1/server/streamableHttp.js";
 import { createServer } from "./lib/server.js";
 
