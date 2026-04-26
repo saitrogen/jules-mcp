@@ -1,516 +1,139 @@
 /**
- * perplexity.js — Jules MCP for Perplexity remote connector
+ * perplexity.js — Minimal Weather MCP
+ * Supports BOTH transport types Perplexity might use:
  *
- * Perplexity's MCP client sends: Accept: application/json, text/event-stream
- * When it sees text/event-stream in Accept → we must respond as SSE.
- * When plain JSON client → respond as application/json.
+ *  1. LEGACY SSE TRANSPORT (old spec, pre-2025-03-26)
+ *     GET  /sse          → opens SSE stream, sends endpoint event
+ *     POST /messages     → client posts JSON-RPC here
  *
- * Connector config:
- *   URL:       https://jules-mcp.saitrogen.deno.net/mcp
- *   Transport: Streamable HTTP
- *   Auth:      Bearer <jules-api-key>
+ *  2. STREAMABLE HTTP TRANSPORT (new spec, 2025-03-26)
+ *     POST /mcp          → all JSON-RPC goes here, reply is JSON or SSE
+ *     GET  /mcp          → optional server-push stream
+ *     DELETE /mcp        → session teardown
  *
- * Session management (MCP spec 2025-03-26):
- *   - initialize → generate UUID, return as Mcp-Session-Id header
- *   - all subsequent requests → must include Mcp-Session-Id header
- *   - missing/invalid session → 400
- *   - DELETE /mcp → terminate session
+ * Tools exposed:
+ *   - get_weather(city: string) → fake static weather data
+ *   - ping() → just returns pong
+ *
+ * Auth: Optional bearer token (accepts anything if no AUTH_KEY env set)
+ *
+ * Connector config in Perplexity:
+ *   Try 1: URL = https://jules-mcp.saitrogen.deno.net/sse   (legacy SSE)
+ *   Try 2: URL = https://jules-mcp.saitrogen.deno.net/mcp   (streamable HTTP)
  */
 
-const SERVER_NAME = "jules-mcp-perplexity";
+const SERVER_NAME    = "weather-mcp";
 const SERVER_VERSION = "1.0.0";
-// Streamable HTTP transport was introduced in 2025-03-26.
-// Echo back the client's requested version if provided (forward-compat).
-const PROTOCOL_VERSION = "2025-03-26";
-const JULES_BASE_URL = "https://jules.googleapis.com/v1alpha";
+const PROTO_V        = "2025-03-26";
+const AUTH_KEY       = Deno.env.get("AUTH_KEY") ?? ""; // leave blank = no auth
 
 // ---------------------------------------------------------------------------
-// Session store  (persists within the Deno isolate)
+// CORS headers (Perplexity calls from browser context)
 // ---------------------------------------------------------------------------
-
-const sessions = new Map(); // sessionId → { created, apiKey }
-
-function newSessionId() {
-  return crypto.randomUUID();
-}
-
 const CORS = {
-  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Origin":  "*",
   "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
   "Access-Control-Allow-Headers":
-    "Content-Type, Authorization, Accept, Mcp-Session-Id, Last-Event-Id",
+    "Content-Type, Authorization, Accept, Mcp-Session-Id, Last-Event-Id, X-Api-Key",
+  "Access-Control-Expose-Headers": "Mcp-Session-Id",
 };
 
 // ---------------------------------------------------------------------------
-// Jules API client
+// Session store (Streamable HTTP only)
 // ---------------------------------------------------------------------------
+const sessions = new Map(); // id → { created, key }
 
-async function julesRequest(apiKey, { method = "GET", path, query, body }) {
-  const url = new URL(
-    path.replace(/^\//, ""),
-    JULES_BASE_URL.replace(/\/$/, "") + "/"
-  );
-  if (query) {
-    for (const [k, v] of Object.entries(query)) {
-      if (v !== undefined && v !== null && v !== "")
-        url.searchParams.set(k, String(v));
-    }
-  }
-  const headers = { "x-goog-api-key": apiKey };
-  if (body !== undefined) headers["content-type"] = "application/json";
-  const res = await fetch(url.toString(), {
-    method,
-    headers,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
-  const text = await res.text();
-  let parsed;
-  try {
-    parsed = text ? JSON.parse(text) : {};
-  } catch {
-    parsed = { raw: text };
-  }
-  if (!res.ok) {
-    const msg =
-      parsed?.error?.message || parsed?.message || text || `HTTP ${res.status}`;
-    const err = new Error(`Jules API error (${res.status}): ${msg}`);
-    err.httpStatus = res.status;
-    err.apiStatus = parsed?.error?.status;
-    throw err;
-  }
-  return parsed;
+function mkSession() {
+  const id = crypto.randomUUID();
+  sessions.set(id, { created: Date.now() });
+  return id;
 }
 
 // ---------------------------------------------------------------------------
-// Tool definitions
+// Auth check
 // ---------------------------------------------------------------------------
+function authorized(req) {
+  if (!AUTH_KEY) return true; // no auth configured → allow all
+  const auth  = req.headers.get("authorization") ?? "";
+  const xkey  = req.headers.get("x-api-key") ?? "";
+  const token = auth.toLowerCase().startsWith("bearer ")
+    ? auth.slice(7).trim()
+    : xkey.trim();
+  return token === AUTH_KEY;
+}
 
+// ---------------------------------------------------------------------------
+// Tool registry
+// ---------------------------------------------------------------------------
 const TOOLS = [
   {
-    name: "jules_health_check",
-    description: "Check Jules API connectivity and health.",
+    name: "get_weather",
+    description: "Get current weather for a city. Returns fake static data for testing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        city: { type: "string", description: "City name, e.g. London" },
+      },
+      required: ["city"],
+    },
+  },
+  {
+    name: "ping",
+    description: "Health check — returns pong.",
     inputSchema: { type: "object", properties: {}, required: [] },
-  },
-  {
-    name: "jules_list_sources",
-    description: "List GitHub repositories (sources) connected to Jules.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        pageSize: { type: "integer", description: "Results per page (1-100)" },
-        pageToken: { type: "string", description: "Pagination token" },
-        filter: {
-          type: "string",
-          description: "Substring filter on repo name/owner",
-        },
-      },
-      required: [],
-    },
-  },
-  {
-    name: "jules_get_source",
-    description: "Get details for one Jules source by sourceId.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        sourceId: { type: "string", description: "e.g. github/myorg/myrepo" },
-      },
-      required: ["sourceId"],
-    },
-  },
-  {
-    name: "jules_create_session",
-    description:
-      "Create a Jules AI coding session for a task prompt on a repository.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        prompt: { type: "string", description: "Task for Jules to perform" },
-        source: {
-          type: "string",
-          description:
-            "Source resource, e.g. sources/github/myorg/myrepo",
-        },
-        startingBranch: {
-          type: "string",
-          description: "Branch to start from (e.g. main)",
-        },
-        title: { type: "string", description: "Optional session title" },
-        requirePlanApproval: {
-          type: "boolean",
-          description: "Require plan approval before coding",
-        },
-      },
-      required: ["prompt", "source"],
-    },
-  },
-  {
-    name: "jules_list_sessions",
-    description: "List your Jules coding sessions.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        pageSize: { type: "integer", description: "Results per page (1-100)" },
-        pageToken: { type: "string", description: "Pagination token" },
-      },
-      required: [],
-    },
-  },
-  {
-    name: "jules_get_session",
-    description: "Get full details for a Jules session.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        sessionId: { type: "string", description: "Session identifier" },
-      },
-      required: ["sessionId"],
-    },
-  },
-  {
-    name: "jules_get_session_state",
-    description:
-      "Quickly check the state of a Jules session (QUEUED, IN_PROGRESS, COMPLETED, FAILED, etc).",
-    inputSchema: {
-      type: "object",
-      properties: {
-        sessionId: { type: "string", description: "Session identifier" },
-      },
-      required: ["sessionId"],
-    },
-  },
-  {
-    name: "jules_get_session_output",
-    description:
-      "Extract pull requests and files from a completed Jules session.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        sessionId: { type: "string", description: "Session identifier" },
-        outputType: {
-          type: "string",
-          enum: ["pullRequest", "files", "all"],
-        },
-      },
-      required: ["sessionId"],
-    },
-  },
-  {
-    name: "jules_list_activities",
-    description: "List activity events for a Jules session.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        sessionId: { type: "string", description: "Session identifier" },
-        pageSize: { type: "integer", description: "Results per page (1-100)" },
-        pageToken: { type: "string", description: "Pagination token" },
-      },
-      required: ["sessionId"],
-    },
-  },
-  {
-    name: "jules_send_message",
-    description: "Send a follow-up message to an active Jules session.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        sessionId: { type: "string", description: "Session identifier" },
-        prompt: { type: "string", description: "Follow-up instruction" },
-      },
-      required: ["sessionId", "prompt"],
-    },
-  },
-  {
-    name: "jules_approve_plan",
-    description:
-      "Approve a Jules session plan awaiting approval before coding starts.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        sessionId: { type: "string", description: "Session identifier" },
-      },
-      required: ["sessionId"],
-    },
-  },
-  {
-    name: "jules_delete_session",
-    description: "Delete a Jules session.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        sessionId: { type: "string", description: "Session identifier" },
-      },
-      required: ["sessionId"],
-    },
   },
 ];
 
-// ---------------------------------------------------------------------------
-// Tool handlers
-// ---------------------------------------------------------------------------
+const FAKE_WEATHER = {
+  london: { temp_c: 12, condition: "Cloudy",  humidity: 78, wind_kph: 20 },
+  paris:  { temp_c: 15, condition: "Sunny",   humidity: 60, wind_kph: 10 },
+  tokyo:  { temp_c: 22, condition: "Rainy",   humidity: 85, wind_kph: 15 },
+  mumbai: { temp_c: 33, condition: "Hot",     humidity: 90, wind_kph: 12 },
+  dubai:  { temp_c: 38, condition: "Clear",   humidity: 40, wind_kph: 18 },
+};
 
-function ok(data) {
-  return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-}
-
-function withCanonical(source) {
-  if (!source || typeof source !== "object") return source;
-  const canonical =
-    source?.name || (source?.id ? `sources/${source.id}` : undefined);
-  return canonical ? { ...source, canonicalSource: canonical } : source;
-}
-
-function extractOutputs(session) {
-  const prs = [],
-    files = [];
-  for (const out of session?.outputs ?? []) {
-    if (out?.pullRequest) prs.push(out.pullRequest);
-    if (Array.isArray(out?.files)) files.push(...out.files);
+function runTool(name, args) {
+  if (name === "ping") {
+    return { content: [{ type: "text", text: JSON.stringify({ pong: true, ts: new Date().toISOString() }) }] };
   }
-  return { pullRequests: prs, files };
-}
-
-async function runTool(apiKey, name, args) {
-  switch (name) {
-    case "jules_health_check": {
-      try {
-        await julesRequest(apiKey, { path: "/sources", query: { pageSize: 1 } });
-        return ok({
-          status: "healthy",
-          apiReachable: true,
-          version: SERVER_VERSION,
-          timestamp: new Date().toISOString(),
-        });
-      } catch (e) {
-        return ok({
-          status: "unhealthy",
-          apiReachable: false,
-          error: e?.message,
-          timestamp: new Date().toISOString(),
-        });
-      }
-    }
-
-    case "jules_list_sources": {
-      const { pageSize, pageToken, filter } = args;
-      const result = await julesRequest(apiKey, {
-        path: "/sources",
-        query: { pageSize, pageToken },
-      });
-      let sources = Array.isArray(result.sources)
-        ? result.sources.map(withCanonical)
-        : [];
-      if (filter) {
-        const q = String(filter).toLowerCase();
-        sources = sources.filter((s) =>
-          [s?.name, s?.id, s?.githubRepo?.owner, s?.githubRepo?.repo]
-            .filter(Boolean)
-            .some((v) => String(v).toLowerCase().includes(q))
-        );
-      }
-      return ok({ ...result, sources });
-    }
-
-    case "jules_get_source": {
-      const { sourceId } = args;
-      if (!sourceId) throw new Error("sourceId is required");
-      const raw = String(sourceId).replace(/^sources\//, "");
-      for (const path of [
-        `/sources/${raw}`,
-        `/sources/${encodeURIComponent(raw)}`,
-      ]) {
-        try {
-          return ok(withCanonical(await julesRequest(apiKey, { path })));
-        } catch (e) {
-          if (e?.httpStatus !== 404) throw e;
-        }
-      }
-      throw new Error(`Source not found: ${sourceId}`);
-    }
-
-    case "jules_create_session": {
-      const { prompt, source, startingBranch, title, requirePlanApproval } =
-        args;
-      if (!prompt) throw new Error("prompt is required");
-      if (!source) throw new Error("source is required");
-      const normalizedSource = source.startsWith("sources/")
-        ? source
-        : `sources/${source}`;
-      const body = { prompt, sourceContext: { source: normalizedSource } };
-      if (title) body.title = title;
-      if (typeof requirePlanApproval === "boolean")
-        body.requirePlanApproval = requirePlanApproval;
-      const branches = startingBranch
-        ? [startingBranch]
-        : [undefined, "main", "master"];
-      let lastErr;
-      for (const branch of branches) {
-        try {
-          const payload = { ...body, sourceContext: { ...body.sourceContext } };
-          if (branch)
-            payload.sourceContext.githubRepoContext = {
-              startingBranch: branch,
-            };
-          return ok(
-            await julesRequest(apiKey, {
-              method: "POST",
-              path: "/sessions",
-              body: payload,
-            })
-          );
-        } catch (e) {
-          lastErr = e;
-          if (
-            !(
-              e?.httpStatus === 400 && e?.apiStatus === "INVALID_ARGUMENT"
-            )
-          )
-            throw e;
-        }
-      }
-      throw lastErr;
-    }
-
-    case "jules_list_sessions": {
-      const { pageSize, pageToken } = args;
-      return ok(
-        await julesRequest(apiKey, {
-          path: "/sessions",
-          query: { pageSize, pageToken },
-        })
-      );
-    }
-
-    case "jules_get_session": {
-      const { sessionId } = args;
-      if (!sessionId) throw new Error("sessionId is required");
-      return ok(
-        await julesRequest(apiKey, {
-          path: `/sessions/${encodeURIComponent(sessionId)}`,
-        })
-      );
-    }
-
-    case "jules_get_session_state": {
-      const { sessionId } = args;
-      if (!sessionId) throw new Error("sessionId is required");
-      const s = await julesRequest(apiKey, {
-        path: `/sessions/${encodeURIComponent(sessionId)}`,
-      });
-      return ok({
-        id: s?.id,
-        name: s?.name,
-        state: s?.state,
-        title: s?.title,
-        updateTime: s?.updateTime,
-      });
-    }
-
-    case "jules_get_session_output": {
-      const { sessionId, outputType = "all" } = args;
-      if (!sessionId) throw new Error("sessionId is required");
-      const session = await julesRequest(apiKey, {
-        path: `/sessions/${encodeURIComponent(sessionId)}`,
-      });
-      const { pullRequests, files } = extractOutputs(session);
-      const result = { sessionId, state: session?.state };
-      if (outputType === "pullRequest" || outputType === "all")
-        result.pullRequests = pullRequests;
-      if (outputType === "files" || outputType === "all")
-        result.files = files;
-      return ok(result);
-    }
-
-    case "jules_list_activities": {
-      const { sessionId, pageSize, pageToken } = args;
-      if (!sessionId) throw new Error("sessionId is required");
-      return ok(
-        await julesRequest(apiKey, {
-          path: `/sessions/${encodeURIComponent(sessionId)}/activities`,
-          query: { pageSize, pageToken },
-        })
-      );
-    }
-
-    case "jules_send_message": {
-      const { sessionId, prompt } = args;
-      if (!sessionId) throw new Error("sessionId is required");
-      if (!prompt) throw new Error("prompt is required");
-      return ok(
-        await julesRequest(apiKey, {
-          method: "POST",
-          path: `/sessions/${encodeURIComponent(sessionId)}:sendMessage`,
-          body: { prompt },
-        })
-      );
-    }
-
-    case "jules_approve_plan": {
-      const { sessionId } = args;
-      if (!sessionId) throw new Error("sessionId is required");
-      return ok(
-        await julesRequest(apiKey, {
-          method: "POST",
-          path: `/sessions/${encodeURIComponent(sessionId)}:approvePlan`,
-          body: {},
-        })
-      );
-    }
-
-    case "jules_delete_session": {
-      const { sessionId } = args;
-      if (!sessionId) throw new Error("sessionId is required");
-      return ok(
-        await julesRequest(apiKey, {
-          method: "DELETE",
-          path: `/sessions/${encodeURIComponent(sessionId)}`,
-        })
-      );
-    }
-
-    default:
-      throw Object.assign(new Error(`Unknown tool: ${name}`), { code: -32601 });
+  if (name === "get_weather") {
+    const city = String(args?.city ?? "").toLowerCase().trim();
+    const data = FAKE_WEATHER[city] ?? {
+      temp_c: 20, condition: "Unknown", humidity: 65, wind_kph: 14,
+      note: `No data for "${args?.city}" — using defaults`,
+    };
+    return { content: [{ type: "text", text: JSON.stringify({ city: args?.city, ...data }, null, 2) }] };
   }
+  throw Object.assign(new Error(`Unknown tool: ${name}`), { code: -32601 });
 }
 
 // ---------------------------------------------------------------------------
-// MCP JSON-RPC dispatcher
+// JSON-RPC dispatcher (shared by both transports)
 // ---------------------------------------------------------------------------
-
-async function dispatch(apiKey, rpc) {
+function dispatch(rpc) {
   const id = rpc?.id ?? null;
   try {
     switch (rpc?.method) {
-      case "initialize": {
-        // Echo back the client's requested protocol version for forward-compat.
-        // Fall back to our supported version if client sends none.
-        const clientVersion = rpc?.params?.protocolVersion ?? PROTOCOL_VERSION;
+      case "initialize":
         return {
-          jsonrpc: "2.0",
-          id,
+          jsonrpc: "2.0", id,
           result: {
-            protocolVersion: clientVersion,
+            protocolVersion: rpc?.params?.protocolVersion ?? PROTO_V,
             capabilities: { tools: {} },
             serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
           },
         };
-      }
 
       case "notifications/initialized":
-        return null;
+        return null; // no response needed
 
       case "tools/list":
         return { jsonrpc: "2.0", id, result: { tools: TOOLS } };
 
       case "tools/call": {
         const { name, arguments: toolArgs } = rpc?.params ?? {};
-        if (!name)
-          return {
-            jsonrpc: "2.0",
-            id,
-            error: { code: -32602, message: "tools/call requires params.name" },
-          };
-        const result = await runTool(apiKey, name, toolArgs ?? {});
+        if (!name) return { jsonrpc: "2.0", id, error: { code: -32602, message: "params.name required" } };
+        const result = runTool(name, toolArgs ?? {});
         return { jsonrpc: "2.0", id, result };
       }
 
@@ -518,212 +141,196 @@ async function dispatch(apiKey, rpc) {
         return { jsonrpc: "2.0", id, result: {} };
 
       default:
-        return {
-          jsonrpc: "2.0",
-          id,
-          error: { code: -32601, message: `Method not found: ${rpc?.method}` },
-        };
+        return { jsonrpc: "2.0", id, error: { code: -32601, message: `Method not found: ${rpc?.method}` } };
     }
   } catch (err) {
-    return {
-      jsonrpc: "2.0",
-      id,
-      error: { code: err?.code ?? -32603, message: err?.message ?? String(err) },
-    };
+    return { jsonrpc: "2.0", id, error: { code: err?.code ?? -32603, message: err?.message ?? String(err) } };
   }
 }
 
 // ---------------------------------------------------------------------------
 // Response helpers
 // ---------------------------------------------------------------------------
-
-function wantsSSE(request) {
-  const accept = request.headers.get("accept") ?? "";
-  return accept.includes("text/event-stream");
-}
-
-function sseResponse(data, extraHeaders = {}) {
-  const payload =
-    data === null
-      ? ""
-      : `event: message\ndata: ${JSON.stringify(data)}\n\n`;
-  return new Response(payload, {
-    status: 200,
-    headers: {
-      "content-type": "text/event-stream",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-      ...CORS,
-      ...extraHeaders,
-    },
-  });
-}
-
-function jsonResp(data, status = 200, extraHeaders = {}) {
+function json(data, status = 200, extra = {}) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "content-type": "application/json", ...CORS, ...extraHeaders },
+    headers: { "content-type": "application/json", ...CORS, ...extra },
   });
 }
 
-function emptyResp(extraHeaders = {}) {
-  return new Response(null, {
-    status: 204,
-    headers: { ...CORS, ...extraHeaders },
+function sseMsg(data) {
+  return data === null ? "" : `event: message\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+function sseResp(data, extra = {}) {
+  return new Response(sseMsg(data), {
+    status: 200,
+    headers: { "content-type": "text/event-stream", "cache-control": "no-cache", ...CORS, ...extra },
   });
 }
 
-// ---------------------------------------------------------------------------
-// HTTP server
-// ---------------------------------------------------------------------------
+function wantsSSE(req) {
+  return (req.headers.get("accept") ?? "").includes("text/event-stream");
+}
 
-async function handle(request) {
-  const url = new URL(request.url);
+// ---------------------------------------------------------------------------
+// SSE client registry (legacy transport — server-push streams)
+// ---------------------------------------------------------------------------
+const sseClients = new Map(); // clientId → ReadableStreamController
 
-  if (url.pathname === "/" || url.pathname === "/health") {
-    return jsonResp({
-      status: "ok",
-      server: SERVER_NAME,
-      version: SERVER_VERSION,
-      protocolVersion: PROTOCOL_VERSION,
-      activeSessions: sessions.size,
+function pushToSSEClient(clientId, data) {
+  const ctrl = sseClients.get(clientId);
+  if (!ctrl) return;
+  try { ctrl.enqueue(new TextEncoder().encode(sseMsg(data))); } catch { sseClients.delete(clientId); }
+}
+
+// ---------------------------------------------------------------------------
+// MAIN HANDLER
+// ---------------------------------------------------------------------------
+async function handle(req) {
+  const url = new URL(req.url);
+  const path = url.pathname;
+
+  // CORS preflight
+  if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
+
+  // Health / root
+  if (path === "/" || path === "/health") {
+    return json({
+      server: SERVER_NAME, version: SERVER_VERSION,
+      protocol: PROTO_V, status: "ok",
+      endpoints: {
+        legacy_sse:       "GET  /sse  (old SSE transport)",
+        legacy_messages:  "POST /messages  (old SSE transport)",
+        streamable_http:  "POST /mcp  (new Streamable HTTP transport)",
+      },
+      tools: TOOLS.map(t => t.name),
     });
   }
 
-  if (request.method === "OPTIONS") {
-    return new Response(null, { status: 204, headers: CORS });
+  // Auth gate (for non-health endpoints)
+  if (!authorized(req)) {
+    return json({ jsonrpc: "2.0", id: null, error: { code: -32001, message: "Unauthorized" } }, 401);
   }
 
-  // -------------------------------------------------------------------------
-  // DELETE /mcp — terminate a session
-  // -------------------------------------------------------------------------
-  if (url.pathname === "/mcp" && request.method === "DELETE") {
-    const sessionId = request.headers.get("mcp-session-id");
-    if (sessionId && sessions.has(sessionId)) {
-      sessions.delete(sessionId);
-      return new Response(null, { status: 200, headers: CORS });
-    }
-    return jsonResp({ error: "Session not found" }, 404);
-  }
+  // =========================================================================
+  // TRANSPORT 1: LEGACY SSE  (GET /sse + POST /messages)
+  // Perplexity UI hint: URL = https://your-server.com/sse
+  // =========================================================================
 
-  // -------------------------------------------------------------------------
-  // GET /mcp — server-initiated messages (SSE stream, optional)
-  // -------------------------------------------------------------------------
-  if (url.pathname === "/mcp" && request.method === "GET") {
-    const sessionId = request.headers.get("mcp-session-id");
-    if (!sessionId || !sessions.has(sessionId)) {
-      return jsonResp({ error: "Invalid or missing Mcp-Session-Id" }, 400);
-    }
-    return new Response("", {
+  if (path === "/sse" && req.method === "GET") {
+    const clientId = crypto.randomUUID();
+    // Build the messages endpoint URL for this client
+    const origin = url.origin;
+    const messagesUrl = `${origin}/messages?clientId=${clientId}`;
+
+    const stream = new ReadableStream({
+      start(ctrl) {
+        sseClients.set(clientId, ctrl);
+        // MCP SSE spec: first event must be "endpoint" with the POST URL
+        const endpointEvent = `event: endpoint\ndata: ${messagesUrl}\n\n`;
+        ctrl.enqueue(new TextEncoder().encode(endpointEvent));
+        console.log(`[SSE] client ${clientId} connected`);
+      },
+      cancel() {
+        sseClients.delete(clientId);
+        console.log(`[SSE] client ${clientId} disconnected`);
+      },
+    });
+
+    return new Response(stream, {
       status: 200,
       headers: {
         "content-type": "text/event-stream",
         "cache-control": "no-cache",
         connection: "keep-alive",
-        "mcp-session-id": sessionId,
         ...CORS,
       },
     });
   }
 
-  // -------------------------------------------------------------------------
-  // POST /mcp — primary endpoint
-  // -------------------------------------------------------------------------
-  if (url.pathname === "/mcp" && request.method === "POST") {
-    // Auth
-    const auth = request.headers.get("authorization") ?? "";
-    const apiKey = auth.toLowerCase().startsWith("bearer ")
-      ? auth.slice(7).trim()
-      : (request.headers.get("x-api-key") ?? "").trim();
-
-    if (!apiKey) {
-      return jsonResp(
-        {
-          jsonrpc: "2.0",
-          id: null,
-          error: {
-            code: -32001,
-            message: "Missing Jules API key. Add Authorization: Bearer <key>.",
-          },
-        },
-        401
-      );
-    }
-
+  if (path === "/messages" && req.method === "POST") {
+    const clientId = url.searchParams.get("clientId");
     let rpc;
-    try {
-      rpc = await request.json();
-    } catch {
-      return jsonResp(
-        {
-          jsonrpc: "2.0",
-          id: null,
-          error: { code: -32700, message: "Parse error" },
-        },
-        400
-      );
+    try { rpc = await req.json(); } catch {
+      return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, 400);
     }
 
-    const useSSE = wantsSSE(request);
+    const result = dispatch(rpc);
+    if (result !== null && clientId && sseClients.has(clientId)) {
+      pushToSSEClient(clientId, result);
+    }
+    return new Response(null, { status: 202, headers: CORS });
+  }
 
-    // ------------------------------------------------------------------
-    // Session management
-    // ------------------------------------------------------------------
-    const incomingSessionId = request.headers.get("mcp-session-id");
+  // =========================================================================
+  // TRANSPORT 2: STREAMABLE HTTP  (POST/GET/DELETE /mcp)
+  // Perplexity UI hint: URL = https://your-server.com/mcp
+  // =========================================================================
+
+  if (path === "/mcp" && req.method === "DELETE") {
+    const sid = req.headers.get("mcp-session-id");
+    if (sid && sessions.has(sid)) {
+      sessions.delete(sid);
+      return new Response(null, { status: 200, headers: CORS });
+    }
+    return json({ error: "Session not found" }, 404);
+  }
+
+  if (path === "/mcp" && req.method === "GET") {
+    const sid = req.headers.get("mcp-session-id");
+    if (!sid || !sessions.has(sid)) {
+      return json({ error: "Missing or invalid Mcp-Session-Id" }, 400);
+    }
+    return new Response("", {
+      status: 200,
+      headers: { "content-type": "text/event-stream", "cache-control": "no-cache", "mcp-session-id": sid, ...CORS },
+    });
+  }
+
+  if (path === "/mcp" && req.method === "POST") {
+    let rpc;
+    try { rpc = await req.json(); } catch {
+      return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, 400);
+    }
+
     const isInit = Array.isArray(rpc)
-      ? rpc.some((r) => r?.method === "initialize")
+      ? rpc.some(r => r?.method === "initialize")
       : rpc?.method === "initialize";
 
+    const incomingSid = req.headers.get("mcp-session-id");
     let sessionId;
 
     if (isInit) {
-      sessionId = newSessionId();
-      sessions.set(sessionId, { created: Date.now(), apiKey });
+      sessionId = mkSession();
     } else {
-      if (!incomingSessionId || !sessions.has(incomingSessionId)) {
-        return jsonResp(
-          {
-            jsonrpc: "2.0",
-            id: null,
-            error: {
-              code: -32600,
-              message: incomingSessionId
-                ? `Unknown session: ${incomingSessionId}`
-                : "Mcp-Session-Id header required",
-            },
-          },
+      if (!incomingSid || !sessions.has(incomingSid)) {
+        return json(
+          { jsonrpc: "2.0", id: null, error: { code: -32600, message: incomingSid ? `Unknown session: ${incomingSid}` : "Mcp-Session-Id header required" } },
           400
         );
       }
-      sessionId = incomingSessionId;
+      sessionId = incomingSid;
     }
 
     const sessionHeader = { "mcp-session-id": sessionId };
 
-    // ------------------------------------------------------------------
-    // Dispatch
-    // ------------------------------------------------------------------
     if (Array.isArray(rpc)) {
-      const results = (
-        await Promise.all(rpc.map((r) => dispatch(apiKey, r)))
-      ).filter(Boolean);
+      const results = (await Promise.all(rpc.map(r => dispatch(r)))).filter(Boolean);
       const payload = results.length === 1 ? results[0] : results;
-      return useSSE
-        ? sseResponse(payload, sessionHeader)
-        : jsonResp(payload, 200, sessionHeader);
+      return wantsSSE(req) ? sseResp(payload, sessionHeader) : json(payload, 200, sessionHeader);
     }
 
-    const result = await dispatch(apiKey, rpc);
-    if (result === null) return emptyResp(sessionHeader);
-    return useSSE
-      ? sseResponse(result, sessionHeader)
-      : jsonResp(result, 200, sessionHeader);
+    const result = dispatch(rpc);
+    if (result === null) return new Response(null, { status: 204, headers: { ...CORS, ...sessionHeader } });
+    return wantsSSE(req) ? sseResp(result, sessionHeader) : json(result, 200, sessionHeader);
   }
 
-  return jsonResp({ error: "Not found" }, 404);
+  return json({ error: "Not found", hint: "Try GET /health" }, 404);
 }
 
 Deno.serve(handle);
-console.log(
-  `${SERVER_NAME} v${SERVER_VERSION} ready — protocol ${PROTOCOL_VERSION} — SSE+JSON dual mode + session management`
-);
+console.log(`\n🌤  ${SERVER_NAME} v${SERVER_VERSION} running`);
+console.log(`   Legacy SSE:      GET  /sse   (point Perplexity here first)`);
+console.log(`   Streamable HTTP: POST /mcp   (point Perplexity here second)`);
+console.log(`   Health:          GET  /health\n`);
