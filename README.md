@@ -62,7 +62,8 @@ If successful, it prints `✅ Smoke test passed`.
 This project now follows npm-style packaging:
 
 - source entry: `index.js`
-- built runtime entry: `dist/index.js`
+- shared server factory: `lib/server.js`
+- built runtime entry: `dist/index.js` + `dist/lib/server.js`
 - package `bin` points to `dist/index.js`
 
 That means it behaves like a published package layout, even when run from GitHub via `npx`.
@@ -119,6 +120,94 @@ You can override base URL directly in MCP client `args` (without relying on `.en
 }
 ```
 
+---
+
+## Use with Perplexity (Remote MCP Connector)
+
+Perplexity supports custom remote MCP connectors over HTTP. This repo ships a
+`http.js` entrypoint (Deno) that exposes the same Jules tools over the
+**MCP Streamable HTTP** transport — the standard for remote connectors.
+
+### How it works
+
+```
+Perplexity → POST /mcp (Authorization: Bearer <your Jules API key>)
+                 ↓
+           http.js extracts key from header
+                 ↓
+           Creates a fresh McpServer scoped to your key (stateless)
+                 ↓
+           Handles MCP request → calls Jules API → returns result
+```
+
+Each request is fully stateless. Jules holds all session state; the server
+holds nothing between requests.
+
+### Step 1 — Deploy to Deno Deploy (free)
+
+1. Go to [https://dash.deno.com](https://dash.deno.com) → **New Project** → **Deploy from GitHub**.
+2. Select this repo (`saitrogen/jules-mcp`).
+3. Set **Entrypoint** to `http.js`.
+4. Leave all env vars blank — the Jules API key comes per-request from Perplexity.
+5. Deploy. You'll get a URL like `https://jules-mcp-xxxx.deno.dev`.
+
+Verify it's running:
+```
+curl https://jules-mcp-xxxx.deno.dev/health
+# → {"status":"ok","server":"jules-mcp","version":"0.3.0"}
+```
+
+### Step 2 — Add the connector in Perplexity
+
+1. Open **Perplexity** → **Settings** → **Connectors** → **Add custom MCP connector**.
+2. Fill in:
+
+| Field | Value |
+|---|---|
+| **URL** | `https://jules-mcp-xxxx.deno.dev/mcp` |
+| **Auth type** | Bearer Token |
+| **Token** | Your Jules API key (from https://jules.google.com/settings#api) |
+
+3. Save. Perplexity will verify the endpoint and list the Jules tools.
+
+### Step 3 — Use it
+
+In any Perplexity conversation, you can now say things like:
+
+- *"List my Jules sources"*
+- *"Create a Jules session to add unit tests to my auth module"*
+- *"Check the status of Jules session 12345"*
+
+Perplexity will call the correct Jules tool automatically.
+
+### Security notes
+
+- Your Jules API key is **never stored** on the server — it is read from the
+  `Authorization` header on each request and discarded immediately after.
+- The Deno Deploy deployment has no persistent storage.
+- If you share the deployment URL, anyone with a valid Jules API key can use it —
+  there is no additional layer of auth beyond the Jules key itself.
+- For a private deployment, add a `CONNECTOR_SECRET` env var check in `http.js`
+  (e.g., verify a shared secret before passing through the Jules key).
+
+### Local HTTP testing (Node + Deno)
+
+```bash
+# With Deno installed:
+JULES_API_KEY=your_key deno run --allow-net --allow-env --allow-read http.js
+
+# Or via npm script:
+JULES_API_KEY=your_key npm run start:http
+
+# Test:
+curl -X POST http://localhost:8000/mcp \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your_jules_api_key" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+```
+
+---
+
 ## Available tools
 
 - `jules_list_sources`
@@ -131,6 +220,13 @@ You can override base URL directly in MCP client `args` (without relying on `.en
 - `jules_send_message`
 - `jules_approve_plan`
 - `jules_get_skill`
+- `jules_wait_for_session`
+- `jules_get_session_state`
+- `jules_list_activities_filtered`
+- `jules_get_session_output`
+- `jules_health_check`
+- `jules_describe_error`
+- `jules_build_session_prompt`
 
 ## Session creation UX conventions (important)
 
@@ -285,12 +381,14 @@ console.log('PR created:', outputs.pullRequests[0].url);
 ## Version History
 
 ### v0.3.0 (Current)
-- ✅ Complete Jules API coverage (16 tools)
+- ✅ Complete Jules API coverage (17 tools)
 - ✅ Session polling and state management
 - ✅ Activity filtering
 - ✅ Error description and recovery helpers
 - ✅ Session templates for common flows
 - ✅ Agent-focused workflows and best practices
+- ✅ **Perplexity remote MCP connector** (HTTP/Deno entrypoint)
+- ✅ Zero breaking changes to existing stdio/local usage
 
 ### v0.2.0
 - 10 core Jules API tools
