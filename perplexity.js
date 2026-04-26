@@ -1,24 +1,14 @@
 /**
  * perplexity.js — Jules MCP server built specifically for Perplexity remote connectors.
  *
- * Design decisions (learned from failed SDK transport attempts):
- *  - NO MCP SDK transport layer (SSEServerTransport / StreamableHTTPServerTransport)
- *    Those always return text/event-stream. Perplexity's connector validator expects
- *    application/json and fails with FETCHER_HTML_STATUS_CODE_ERROR on SSE.
- *  - Implements MCP JSON-RPC 2.0 directly: parse request → dispatch → return JSON.
- *  - Stateless per-request. No session IDs, no persistent connections.
- *  - Single Deno Deploy entrypoint. Set this as the entrypoint in deno.json for the
- *    Perplexity-facing deployment, OR deploy as a separate Deno Deploy project.
+ * Zero SDK transport. Pure MCP JSON-RPC 2.0 over plain HTTP.
+ * Every response is application/json — no SSE, no streaming.
  *
  * Perplexity connector config:
- *   URL:        https://<your-project>.deno.dev/mcp
- *   Auth type:  Bearer token
+ *   URL:        https://jules-mcp.saitrogen.deno.net/mcp
+ *   Auth type:  Bearer
  *   Token:      <your Jules API key>
- *
- * Deno Deploy setup:
- *   1. Fork / push this file to your repo
- *   2. Create a new Deno Deploy project pointing to this file as entrypoint
- *   3. No env vars needed — Jules API key comes from the Authorization header
+ *   Transport:  Streamable HTTP  (select this in Perplexity UI)
  */
 
 const SERVER_NAME = "jules-mcp-perplexity";
@@ -28,8 +18,8 @@ const JULES_BASE_URL = "https://jules.googleapis.com/v1alpha";
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept",
+  "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept, Mcp-Session-Id",
 };
 
 // ---------------------------------------------------------------------------
@@ -64,13 +54,13 @@ async function julesRequest(apiKey, { method = "GET", path, query, body }) {
 }
 
 // ---------------------------------------------------------------------------
-// Tool definitions (what Perplexity sees in tools/list)
+// Tool definitions
 // ---------------------------------------------------------------------------
 
 const TOOLS = [
   {
     name: "jules_health_check",
-    description: "Check Jules API connectivity and basic health.",
+    description: "Check Jules API connectivity and health.",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
   {
@@ -79,8 +69,8 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        pageSize: { type: "integer", description: "Results per page (1-100)", minimum: 1, maximum: 100 },
-        pageToken: { type: "string", description: "Pagination token from previous response" },
+        pageSize: { type: "integer", description: "Results per page (1-100)" },
+        pageToken: { type: "string", description: "Pagination token" },
         filter: { type: "string", description: "Substring filter on repo name/owner" },
       },
       required: [],
@@ -92,7 +82,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        sourceId: { type: "string", description: "Source ID, e.g. github/myorg/myrepo or sources/github/myorg/myrepo" },
+        sourceId: { type: "string", description: "e.g. github/myorg/myrepo" },
       },
       required: ["sourceId"],
     },
@@ -103,11 +93,11 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        prompt: { type: "string", description: "Task instruction for Jules (what to code / fix / review)" },
+        prompt: { type: "string", description: "Task for Jules to perform" },
         source: { type: "string", description: "Source resource, e.g. sources/github/myorg/myrepo" },
-        startingBranch: { type: "string", description: "Branch to start work from (e.g. main)" },
+        startingBranch: { type: "string", description: "Branch to start from (e.g. main)" },
         title: { type: "string", description: "Optional session title" },
-        requirePlanApproval: { type: "boolean", description: "Require plan approval before Jules starts coding" },
+        requirePlanApproval: { type: "boolean", description: "Require plan approval before coding" },
       },
       required: ["prompt", "source"],
     },
@@ -118,15 +108,15 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        pageSize: { type: "integer", description: "Results per page (1-100)", minimum: 1, maximum: 100 },
-        pageToken: { type: "string", description: "Pagination token from previous response" },
+        pageSize: { type: "integer", description: "Results per page (1-100)" },
+        pageToken: { type: "string", description: "Pagination token" },
       },
       required: [],
     },
   },
   {
     name: "jules_get_session",
-    description: "Get details for a Jules coding session by sessionId.",
+    description: "Get full details for a Jules session.",
     inputSchema: {
       type: "object",
       properties: {
@@ -153,7 +143,7 @@ const TOOLS = [
       type: "object",
       properties: {
         sessionId: { type: "string", description: "Session identifier" },
-        outputType: { type: "string", enum: ["pullRequest", "files", "all"], description: "What to extract" },
+        outputType: { type: "string", enum: ["pullRequest", "files", "all"] },
       },
       required: ["sessionId"],
     },
@@ -165,31 +155,31 @@ const TOOLS = [
       type: "object",
       properties: {
         sessionId: { type: "string", description: "Session identifier" },
-        pageSize: { type: "integer", description: "Results per page (1-100)", minimum: 1, maximum: 100 },
-        pageToken: { type: "string", description: "Pagination token from previous response" },
+        pageSize: { type: "integer", description: "Results per page (1-100)" },
+        pageToken: { type: "string", description: "Pagination token" },
       },
       required: ["sessionId"],
     },
   },
   {
     name: "jules_send_message",
-    description: "Send a follow-up message or instruction to an active Jules session.",
+    description: "Send a follow-up message to an active Jules session.",
     inputSchema: {
       type: "object",
       properties: {
         sessionId: { type: "string", description: "Session identifier" },
-        prompt: { type: "string", description: "Follow-up instruction to send" },
+        prompt: { type: "string", description: "Follow-up instruction" },
       },
       required: ["sessionId", "prompt"],
     },
   },
   {
     name: "jules_approve_plan",
-    description: "Approve a Jules session plan that is awaiting approval before coding starts.",
+    description: "Approve a Jules session plan awaiting approval before coding starts.",
     inputSchema: {
       type: "object",
       properties: {
-        sessionId: { type: "string", description: "Session identifier waiting for plan approval" },
+        sessionId: { type: "string", description: "Session identifier" },
       },
       required: ["sessionId"],
     },
@@ -200,7 +190,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        sessionId: { type: "string", description: "Session identifier to delete" },
+        sessionId: { type: "string", description: "Session identifier" },
       },
       required: ["sessionId"],
     },
@@ -242,21 +232,21 @@ async function runTool(apiKey, name, args) {
     }
 
     case "jules_list_sources": {
-      const { pageSize, pageToken, filter } = args ?? {};
+      const { pageSize, pageToken, filter } = args;
       const result = await julesRequest(apiKey, { path: "/sources", query: { pageSize, pageToken } });
       let sources = Array.isArray(result.sources) ? result.sources.map(withCanonical) : [];
       if (filter) {
         const q = String(filter).toLowerCase();
-        sources = sources.filter((s) => {
-          return [s?.name, s?.id, s?.githubRepo?.owner, s?.githubRepo?.repo]
-            .filter(Boolean).some((v) => String(v).toLowerCase().includes(q));
-        });
+        sources = sources.filter((s) =>
+          [s?.name, s?.id, s?.githubRepo?.owner, s?.githubRepo?.repo]
+            .filter(Boolean).some((v) => String(v).toLowerCase().includes(q))
+        );
       }
       return ok({ ...result, sources });
     }
 
     case "jules_get_source": {
-      const { sourceId } = args ?? {};
+      const { sourceId } = args;
       if (!sourceId) throw new Error("sourceId is required");
       const raw = String(sourceId).replace(/^sources\//, "");
       for (const path of [`/sources/${raw}`, `/sources/${encodeURIComponent(raw)}`]) {
@@ -267,7 +257,7 @@ async function runTool(apiKey, name, args) {
     }
 
     case "jules_create_session": {
-      const { prompt, source, startingBranch, title, requirePlanApproval } = args ?? {};
+      const { prompt, source, startingBranch, title, requirePlanApproval } = args;
       if (!prompt) throw new Error("prompt is required");
       if (!source) throw new Error("source is required");
       const normalizedSource = source.startsWith("sources/") ? source : `sources/${source}`;
@@ -290,25 +280,25 @@ async function runTool(apiKey, name, args) {
     }
 
     case "jules_list_sessions": {
-      const { pageSize, pageToken } = args ?? {};
+      const { pageSize, pageToken } = args;
       return ok(await julesRequest(apiKey, { path: "/sessions", query: { pageSize, pageToken } }));
     }
 
     case "jules_get_session": {
-      const { sessionId } = args ?? {};
+      const { sessionId } = args;
       if (!sessionId) throw new Error("sessionId is required");
       return ok(await julesRequest(apiKey, { path: `/sessions/${encodeURIComponent(sessionId)}` }));
     }
 
     case "jules_get_session_state": {
-      const { sessionId } = args ?? {};
+      const { sessionId } = args;
       if (!sessionId) throw new Error("sessionId is required");
       const s = await julesRequest(apiKey, { path: `/sessions/${encodeURIComponent(sessionId)}` });
       return ok({ id: s?.id, name: s?.name, state: s?.state, title: s?.title, updateTime: s?.updateTime });
     }
 
     case "jules_get_session_output": {
-      const { sessionId, outputType = "all" } = args ?? {};
+      const { sessionId, outputType = "all" } = args;
       if (!sessionId) throw new Error("sessionId is required");
       const session = await julesRequest(apiKey, { path: `/sessions/${encodeURIComponent(sessionId)}` });
       const { pullRequests, files } = extractOutputs(session);
@@ -319,26 +309,26 @@ async function runTool(apiKey, name, args) {
     }
 
     case "jules_list_activities": {
-      const { sessionId, pageSize, pageToken } = args ?? {};
+      const { sessionId, pageSize, pageToken } = args;
       if (!sessionId) throw new Error("sessionId is required");
       return ok(await julesRequest(apiKey, { path: `/sessions/${encodeURIComponent(sessionId)}/activities`, query: { pageSize, pageToken } }));
     }
 
     case "jules_send_message": {
-      const { sessionId, prompt } = args ?? {};
+      const { sessionId, prompt } = args;
       if (!sessionId) throw new Error("sessionId is required");
       if (!prompt) throw new Error("prompt is required");
       return ok(await julesRequest(apiKey, { method: "POST", path: `/sessions/${encodeURIComponent(sessionId)}:sendMessage`, body: { prompt } }));
     }
 
     case "jules_approve_plan": {
-      const { sessionId } = args ?? {};
+      const { sessionId } = args;
       if (!sessionId) throw new Error("sessionId is required");
       return ok(await julesRequest(apiKey, { method: "POST", path: `/sessions/${encodeURIComponent(sessionId)}:approvePlan`, body: {} }));
     }
 
     case "jules_delete_session": {
-      const { sessionId } = args ?? {};
+      const { sessionId } = args;
       if (!sessionId) throw new Error("sessionId is required");
       return ok(await julesRequest(apiKey, { method: "DELETE", path: `/sessions/${encodeURIComponent(sessionId)}` }));
     }
@@ -354,13 +344,11 @@ async function runTool(apiKey, name, args) {
 
 async function dispatch(apiKey, rpc) {
   const id = rpc?.id ?? null;
-
   try {
     switch (rpc?.method) {
       case "initialize":
         return {
-          jsonrpc: "2.0",
-          id,
+          jsonrpc: "2.0", id,
           result: {
             protocolVersion: PROTOCOL_VERSION,
             capabilities: { tools: {} },
@@ -369,22 +357,15 @@ async function dispatch(apiKey, rpc) {
         };
 
       case "notifications/initialized":
-        // Notification — no response needed, return null to skip sending
         return null;
 
       case "tools/list":
-        return {
-          jsonrpc: "2.0",
-          id,
-          result: { tools: TOOLS },
-        };
+        return { jsonrpc: "2.0", id, result: { tools: TOOLS } };
 
       case "tools/call": {
-        const { name, arguments: args } = rpc?.params ?? {};
-        if (!name) {
-          return jsonRpcError(id, -32602, "tools/call requires params.name");
-        }
-        const result = await runTool(apiKey, name, args ?? {});
+        const { name, arguments: toolArgs } = rpc?.params ?? {};
+        if (!name) return { jsonrpc: "2.0", id, error: { code: -32602, message: "tools/call requires params.name" } };
+        const result = await runTool(apiKey, name, toolArgs ?? {});
         return { jsonrpc: "2.0", id, result };
       }
 
@@ -392,23 +373,18 @@ async function dispatch(apiKey, rpc) {
         return { jsonrpc: "2.0", id, result: {} };
 
       default:
-        return jsonRpcError(id, -32601, `Method not found: ${rpc?.method}`);
+        return { jsonrpc: "2.0", id, error: { code: -32601, message: `Method not found: ${rpc?.method}` } };
     }
   } catch (err) {
-    const code = err?.code ?? -32603;
-    return jsonRpcError(id, code, err?.message ?? String(err));
+    return { jsonrpc: "2.0", id, error: { code: err?.code ?? -32603, message: err?.message ?? String(err) } };
   }
-}
-
-function jsonRpcError(id, code, message) {
-  return { jsonrpc: "2.0", id, error: { code, message } };
 }
 
 // ---------------------------------------------------------------------------
 // HTTP server
 // ---------------------------------------------------------------------------
 
-function json(data, status = 200) {
+function jsonResp(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
     headers: { "content-type": "application/json", ...CORS },
@@ -418,20 +394,17 @@ function json(data, status = 200) {
 async function handle(request) {
   const url = new URL(request.url);
 
-  // Health check
   if (url.pathname === "/" || url.pathname === "/health") {
-    return json({ status: "ok", server: SERVER_NAME, version: SERVER_VERSION });
+    return jsonResp({ status: "ok", server: SERVER_NAME, version: SERVER_VERSION });
   }
 
-  // CORS preflight
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: CORS });
   }
 
-  // MCP endpoint
   if (url.pathname === "/mcp") {
     if (request.method !== "POST") {
-      return json({ error: "POST required" }, 405);
+      return jsonResp({ error: "POST required" }, 405);
     }
 
     // Auth
@@ -441,36 +414,28 @@ async function handle(request) {
       : (request.headers.get("x-api-key") ?? "").trim();
 
     if (!apiKey) {
-      return json(
-        { jsonrpc: "2.0", id: null, error: { code: -32001, message: "Missing Jules API key. Set Authorization: Bearer <key> in connector settings." } },
+      return jsonResp(
+        { jsonrpc: "2.0", id: null, error: { code: -32001, message: "Missing Jules API key. Add Authorization: Bearer <key> in connector settings." } },
         401
       );
     }
 
-    // Parse body
     let rpc;
-    try {
-      rpc = await request.json();
-    } catch {
-      return json(jsonRpcError(null, -32700, "Parse error: invalid JSON"), 400);
-    }
+    try { rpc = await request.json(); }
+    catch { return jsonResp({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, 400); }
 
-    // Batch support (array of requests)
     if (Array.isArray(rpc)) {
-      const results = await Promise.all(
-        rpc.map((r) => dispatch(apiKey, r))
-      );
-      const filtered = results.filter(Boolean);
-      return json(filtered.length === 1 ? filtered[0] : filtered);
+      const results = (await Promise.all(rpc.map((r) => dispatch(apiKey, r)))).filter(Boolean);
+      return jsonResp(results.length === 1 ? results[0] : results);
     }
 
     const result = await dispatch(apiKey, rpc);
     if (result === null) return new Response(null, { status: 204, headers: CORS });
-    return json(result);
+    return jsonResp(result);
   }
 
-  return json({ error: "Not found" }, 404);
+  return jsonResp({ error: "Not found" }, 404);
 }
 
 Deno.serve(handle);
-console.log(`${SERVER_NAME} v${SERVER_VERSION} running`);
+console.log(`${SERVER_NAME} v${SERVER_VERSION} ready`);

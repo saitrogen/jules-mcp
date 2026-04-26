@@ -1,12 +1,13 @@
 {
-  "name": "jules-mcp-http",
-  "version": "0.3.0",
-  "exports": "./http.js",
-  "description": "Jules MCP server — HTTP entrypoint for Perplexity remote connector",
+  "name": "jules-mcp-perplexity",
+  "version": "1.0.0",
+  "exports": "./perplexity.js",
+  "description": "Jules MCP server — Perplexity remote connector entrypoint",
   "nodeModulesDir": "auto",
   "tasks": {
-    "start": "deno run --allow-net --allow-env http.js",
-    "dev": "deno run --allow-net --allow-env --watch http.js"
+    "start": "deno run --allow-net --allow-env perplexity.js",
+    "dev": "deno run --allow-net --allow-env --watch perplexity.js",
+    "start:local": "deno run --allow-net --allow-env http.js"
   },
   "lint": {
     "rules": {
