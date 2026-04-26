@@ -1,9 +1,10 @@
 /**
  * http.js — Deno Deploy HTTP entrypoint for the Perplexity remote MCP connector.
  *
- * The MCP SDK's StreamableHTTPServerTransport expects Node.js-style
- * req/res objects (IncomingMessage / ServerResponse). This file bridges
- * Deno's Web-standard Request/Response to that interface.
+ * The MCP SDK's StreamableHTTPServerTransport returns text/event-stream for all
+ * responses. Perplexity's connector validator expects application/json for RPC
+ * calls. This file bridges both: single-shot SSE responses (one event) are
+ * converted to plain JSON; streaming responses are passed through as SSE.
  *
  * Deploy: https://dash.deno.com → link repo, entrypoint = http.js
  *         Install command: deno install
@@ -38,15 +39,13 @@ function extractApiKey(request) {
   return null;
 }
 
-/**
- * Build a fake Node.js IncomingMessage-compatible object from a Web Request.
- * The SDK only reads: req.method, req.headers (plain object), req.url
- */
-function buildNodeReq(request, url, body) {
+function buildNodeReq(request, url) {
   const headers = {};
   for (const [k, v] of request.headers.entries()) {
     headers[k.toLowerCase()] = v;
   }
+  // Force Accept to include both so the SDK doesn't reject the request
+  headers["accept"] = "application/json, text/event-stream";
   return {
     method: request.method,
     url: url.pathname + url.search,
@@ -55,8 +54,9 @@ function buildNodeReq(request, url, body) {
 }
 
 /**
- * Build a fake Node.js ServerResponse-compatible object.
- * Captures status + headers + body chunks and resolves to a Web Response.
+ * Build a fake Node.js ServerResponse.
+ * Buffers all output and resolves a Promise<Response> when end() is called.
+ * For SSE (flushHeaders + write + end), collects all SSE chunks.
  */
 function buildNodeRes() {
   let statusCode = 200;
@@ -64,16 +64,9 @@ function buildNodeRes() {
   const chunks = [];
   let ended = false;
   let resolveResponse;
-  let rejectResponse;
-  // SSE stream support
-  const emitter = new EventEmitter();
-  let sseController = null;
-  let sseStream = null;
 
-  const promise = new Promise((resolve, reject) => {
-    resolveResponse = resolve;
-    rejectResponse = reject;
-  });
+  const promise = new Promise((resolve) => { resolveResponse = resolve; });
+  const emitter = new EventEmitter();
 
   const res = {
     statusCode,
@@ -90,44 +83,17 @@ function buildNodeRes() {
       return res;
     },
 
-    setHeader(name, value) {
-      responseHeaders[name.toLowerCase()] = value;
-    },
+    setHeader(name, value) { responseHeaders[name.toLowerCase()] = value; },
+    getHeader(name) { return responseHeaders[name.toLowerCase()]; },
 
-    getHeader(name) {
-      return responseHeaders[name.toLowerCase()];
-    },
-
-    // SSE: flushHeaders signals we're starting a streaming response
+    // flushHeaders: SDK uses this for SSE streams.
+    // We mark headersSent but keep buffering — we'll decide stream vs JSON at end().
     flushHeaders() {
       res.headersSent = true;
-      const stream = new ReadableStream({
-        start(controller) {
-          sseController = controller;
-        },
-        cancel() {
-          emitter.emit("close");
-        },
-      });
-      sseStream = stream;
-      resolveResponse(
-        new Response(stream, {
-          status: statusCode,
-          headers: responseHeaders,
-        })
-      );
+      return res;
     },
 
-    // write() is used for SSE data chunks
     write(chunk) {
-      if (sseController) {
-        const data = typeof chunk === "string"
-          ? new TextEncoder().encode(chunk)
-          : chunk;
-        sseController.enqueue(data);
-        return true;
-      }
-      // Non-SSE buffered write
       chunks.push(typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk));
       return true;
     },
@@ -135,27 +101,58 @@ function buildNodeRes() {
     end(data) {
       if (ended) return;
       ended = true;
-      if (sseController) {
-        sseController.close();
+      if (data) chunks.push(typeof data === "string" ? data : new TextDecoder().decode(data));
+
+      const body = chunks.join("");
+      const contentType = responseHeaders["content-type"] ?? "";
+
+      // If the response is SSE and contains exactly ONE complete event,
+      // convert it to plain application/json so Perplexity can parse it.
+      if (contentType.includes("text/event-stream")) {
+        const jsonBody = extractSingleSseJson(body);
+        if (jsonBody !== null) {
+          responseHeaders["content-type"] = "application/json";
+          delete responseHeaders["cache-control"];
+          resolveResponse(new Response(jsonBody, { status: statusCode, headers: responseHeaders }));
+          return;
+        }
+        // Multi-event SSE — stream it as-is
+        resolveResponse(new Response(body, { status: statusCode, headers: responseHeaders }));
         return;
       }
-      if (data) chunks.push(typeof data === "string" ? data : new TextDecoder().decode(data));
-      const body = chunks.join("");
-      resolveResponse(
-        new Response(body || null, {
-          status: statusCode,
-          headers: responseHeaders,
-        })
-      );
+
+      resolveResponse(new Response(body || null, { status: statusCode, headers: responseHeaders }));
     },
 
-    on(event, listener) {
-      emitter.on(event, listener);
-      return res;
-    },
+    on(event, listener) { emitter.on(event, listener); return res; },
   };
 
-  return { res, promise };
+  return { res, promise, emitter };
+}
+
+/**
+ * Parse a buffered SSE body and extract the JSON payload if there is exactly
+ * one complete 'data:' line. Returns the JSON string or null.
+ *
+ * SSE format: "event: message\ndata: {...}\n\n"
+ */
+function extractSingleSseJson(body) {
+  const dataLines = [];
+  for (const line of body.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("data:")) {
+      dataLines.push(trimmed.slice(5).trim());
+    }
+  }
+  if (dataLines.length === 1) {
+    try {
+      JSON.parse(dataLines[0]); // validate it's real JSON
+      return dataLines[0];
+    } catch {
+      return null;
+    }
+  }
+  return null; // 0 or multiple data lines — keep as SSE
 }
 
 async function handleMcp(request, url) {
@@ -174,7 +171,6 @@ async function handleMcp(request, url) {
     );
   }
 
-  // Parse body for POST
   let parsedBody = undefined;
   if (request.method === "POST") {
     try {
@@ -188,22 +184,16 @@ async function handleMcp(request, url) {
   }
 
   const mcpServer = createServer(apiKey);
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined, // stateless mode
-  });
-
-  const nodeReq = buildNodeReq(request, url, parsedBody);
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  const nodeReq = buildNodeReq(request, url);
   const { res: nodeRes, promise } = buildNodeRes();
 
   try {
     await mcpServer.connect(transport);
-    // Fire-and-forget: handleRequest writes to nodeRes asynchronously
     transport.handleRequest(nodeReq, nodeRes, parsedBody).catch((err) => {
-      console.error("transport.handleRequest error:", err);
+      console.error("transport error:", err);
     });
-    // Wait for the response to be resolved (end() or flushHeaders() called)
-    const response = await promise;
-    return response;
+    return await promise;
   } catch (err) {
     console.error("handleMcp error:", err);
     return new Response(
