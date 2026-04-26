@@ -19,7 +19,9 @@
 
 const SERVER_NAME = "jules-mcp-perplexity";
 const SERVER_VERSION = "1.0.0";
-const PROTOCOL_VERSION = "2024-11-05";
+// Streamable HTTP transport was introduced in 2025-03-26.
+// Echo back the client's requested version if provided (forward-compat).
+const PROTOCOL_VERSION = "2025-03-26";
 const JULES_BASE_URL = "https://jules.googleapis.com/v1alpha";
 
 // ---------------------------------------------------------------------------
@@ -479,16 +481,20 @@ async function dispatch(apiKey, rpc) {
   const id = rpc?.id ?? null;
   try {
     switch (rpc?.method) {
-      case "initialize":
+      case "initialize": {
+        // Echo back the client's requested protocol version for forward-compat.
+        // Fall back to our supported version if client sends none.
+        const clientVersion = rpc?.params?.protocolVersion ?? PROTOCOL_VERSION;
         return {
           jsonrpc: "2.0",
           id,
           result: {
-            protocolVersion: PROTOCOL_VERSION,
+            protocolVersion: clientVersion,
             capabilities: { tools: {} },
             serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
           },
         };
+      }
 
       case "notifications/initialized":
         return null;
@@ -561,7 +567,10 @@ function jsonResp(data, status = 200, extraHeaders = {}) {
 }
 
 function emptyResp(extraHeaders = {}) {
-  return new Response(null, { status: 204, headers: { ...CORS, ...extraHeaders } });
+  return new Response(null, {
+    status: 204,
+    headers: { ...CORS, ...extraHeaders },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -576,6 +585,7 @@ async function handle(request) {
       status: "ok",
       server: SERVER_NAME,
       version: SERVER_VERSION,
+      protocolVersion: PROTOCOL_VERSION,
       activeSessions: sessions.size,
     });
   }
@@ -604,7 +614,6 @@ async function handle(request) {
     if (!sessionId || !sessions.has(sessionId)) {
       return jsonResp({ error: "Invalid or missing Mcp-Session-Id" }, 400);
     }
-    // Return an open SSE stream that stays idle (no server-push messages needed).
     return new Response("", {
       status: 200,
       headers: {
@@ -634,8 +643,7 @@ async function handle(request) {
           id: null,
           error: {
             code: -32001,
-            message:
-              "Missing Jules API key. Add Authorization: Bearer <key>.",
+            message: "Missing Jules API key. Add Authorization: Bearer <key>.",
           },
         },
         401
@@ -647,7 +655,11 @@ async function handle(request) {
       rpc = await request.json();
     } catch {
       return jsonResp(
-        { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } },
+        {
+          jsonrpc: "2.0",
+          id: null,
+          error: { code: -32700, message: "Parse error" },
+        },
         400
       );
     }
@@ -665,11 +677,9 @@ async function handle(request) {
     let sessionId;
 
     if (isInit) {
-      // Always create a new session on initialize
       sessionId = newSessionId();
       sessions.set(sessionId, { created: Date.now(), apiKey });
     } else {
-      // All non-initialize requests MUST have a valid session ID
       if (!incomingSessionId || !sessions.has(incomingSessionId)) {
         return jsonResp(
           {
@@ -715,5 +725,5 @@ async function handle(request) {
 
 Deno.serve(handle);
 console.log(
-  `${SERVER_NAME} v${SERVER_VERSION} ready — SSE + JSON dual mode + session management`
+  `${SERVER_NAME} v${SERVER_VERSION} ready — protocol ${PROTOCOL_VERSION} — SSE+JSON dual mode + session management`
 );
