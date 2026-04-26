@@ -1,14 +1,14 @@
 /**
- * perplexity.js — Jules MCP server built specifically for Perplexity remote connectors.
+ * perplexity.js — Jules MCP for Perplexity remote connector
  *
- * Zero SDK transport. Pure MCP JSON-RPC 2.0 over plain HTTP.
- * Every response is application/json — no SSE, no streaming.
+ * Perplexity's MCP client sends: Accept: application/json, text/event-stream
+ * When it sees text/event-stream in Accept → we must respond as SSE.
+ * When plain JSON client → respond as application/json.
  *
- * Perplexity connector config:
- *   URL:        https://jules-mcp.saitrogen.deno.net/mcp
- *   Auth type:  Bearer
- *   Token:      <your Jules API key>
- *   Transport:  Streamable HTTP  (select this in Perplexity UI)
+ * Connector config:
+ *   URL:       https://jules-mcp.saitrogen.deno.net/mcp
+ *   Transport: Streamable HTTP
+ *   Auth:      Bearer <jules-api-key>
  */
 
 const SERVER_NAME = "jules-mcp-perplexity";
@@ -19,7 +19,7 @@ const JULES_BASE_URL = "https://jules.googleapis.com/v1alpha";
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept, Mcp-Session-Id",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept, Mcp-Session-Id, Last-Event-Id",
 };
 
 // ---------------------------------------------------------------------------
@@ -381,8 +381,28 @@ async function dispatch(apiKey, rpc) {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP server
+// Response helpers
 // ---------------------------------------------------------------------------
+
+function wantsSSE(request) {
+  const accept = request.headers.get("accept") ?? "";
+  return accept.includes("text/event-stream");
+}
+
+// Wrap a JSON-RPC result as a single SSE event and close the stream.
+// Perplexity's StreamableHTTP client reads the stream, gets the event, done.
+function sseResponse(data) {
+  const payload = data === null ? "" : `event: message\ndata: ${JSON.stringify(data)}\n\n`;
+  return new Response(payload, {
+    status: 200,
+    headers: {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      "connection": "keep-alive",
+      ...CORS,
+    },
+  });
+}
 
 function jsonResp(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -390,6 +410,14 @@ function jsonResp(data, status = 200) {
     headers: { "content-type": "application/json", ...CORS },
   });
 }
+
+function emptyResp() {
+  return new Response(null, { status: 204, headers: CORS });
+}
+
+// ---------------------------------------------------------------------------
+// HTTP server
+// ---------------------------------------------------------------------------
 
 async function handle(request) {
   const url = new URL(request.url);
@@ -415,7 +443,7 @@ async function handle(request) {
 
     if (!apiKey) {
       return jsonResp(
-        { jsonrpc: "2.0", id: null, error: { code: -32001, message: "Missing Jules API key. Add Authorization: Bearer <key> in connector settings." } },
+        { jsonrpc: "2.0", id: null, error: { code: -32001, message: "Missing Jules API key. Add Authorization: Bearer <key>." } },
         401
       );
     }
@@ -424,18 +452,23 @@ async function handle(request) {
     try { rpc = await request.json(); }
     catch { return jsonResp({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, 400); }
 
+    const useSSE = wantsSSE(request);
+
+    // Batch
     if (Array.isArray(rpc)) {
       const results = (await Promise.all(rpc.map((r) => dispatch(apiKey, r)))).filter(Boolean);
-      return jsonResp(results.length === 1 ? results[0] : results);
+      const payload = results.length === 1 ? results[0] : results;
+      return useSSE ? sseResponse(payload) : jsonResp(payload);
     }
 
+    // Single
     const result = await dispatch(apiKey, rpc);
-    if (result === null) return new Response(null, { status: 204, headers: CORS });
-    return jsonResp(result);
+    if (result === null) return emptyResp();
+    return useSSE ? sseResponse(result) : jsonResp(result);
   }
 
   return jsonResp({ error: "Not found" }, 404);
 }
 
 Deno.serve(handle);
-console.log(`${SERVER_NAME} v${SERVER_VERSION} ready`);
+console.log(`${SERVER_NAME} v${SERVER_VERSION} ready — SSE + JSON dual mode`);
