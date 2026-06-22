@@ -109,16 +109,6 @@ const SESSION_TEMPLATES = {
   add_readme:     { title: "Write README",          prompt: "Write a comprehensive README.md covering: project purpose, installation, usage examples, configuration, and contributing guide." },
 };
 
-const ERROR_CATALOG = {
-  400: { suggestion: "Check required fields and formats. Verify source/sessionId format.", retryable: false },
-  401: { suggestion: "Verify JULES_API_KEY is set correctly.",                             retryable: false },
-  403: { suggestion: "Check if your account has access to this source or session.",        retryable: false },
-  404: { suggestion: "Verify the session/source ID exists and use canonical format.",      retryable: false },
-  429: { suggestion: "Rate limited — wait before retrying.",                               retryable: true  },
-  500: { suggestion: "Jules service may be temporarily unavailable. Retry soon.",          retryable: true  },
-  503: { suggestion: "Jules service is temporarily down. Retry in a few moments.",          retryable: true  },
-};
-
 // ---------------------------------------------------------------------------
 // Tool definitions
 // ---------------------------------------------------------------------------
@@ -127,19 +117,6 @@ const TOOLS = [
     name: "jules_health_check",
     description: "Check Jules API connectivity and health. Returns server version, reachability, and current timestamp.",
     inputSchema: { type: "object", properties: {}, required: [] },
-  },
-  {
-    name: "jules_describe_error",
-    description: "Parse a Jules API error and return a human-readable explanation with recovery suggestions.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        httpStatus: { type: "integer", description: "HTTP status code from the failed request (e.g. 400, 404, 429)" },
-        apiStatus:  { type: "string",  description: "API error status string (e.g. INVALID_ARGUMENT, NOT_FOUND)" },
-        message:    { type: "string",  description: "Original error message text" },
-      },
-      required: [],
-    },
   },
   {
     name: "jules_list_sources",
@@ -156,7 +133,7 @@ const TOOLS = [
   },
   {
     name: "jules_get_source",
-    description: "Get full details for one Jules source (repository). Accepts github/owner/repo or sources/github/owner/repo format.",
+    description: "Get full details for one Jules source (repository), including available branches and default branch. Accepts github/owner/repo or sources/github/owner/repo format. Call this before creating a session to see which branches are available.",
     inputSchema: {
       type: "object",
       properties: {
@@ -167,7 +144,7 @@ const TOOLS = [
   },
   {
     name: "jules_create_session",
-    description: "Create a new Jules AI coding session. Jules will plan and implement the task on the specified repository branch.",
+    description: "Create a new Jules AI coding session. Jules will plan and implement the task on the specified repository branch. Set automationMode to AUTO_CREATE_PR for fully autonomous operation.",
     inputSchema: {
       type: "object",
       properties: {
@@ -175,6 +152,7 @@ const TOOLS = [
         source:              { type: "string",  description: "Repository source, e.g. sources/github/myorg/myrepo" },
         startingBranch:      { type: "string",  description: "Branch to start from (e.g. main). Auto-detected if omitted." },
         title:               { type: "string",  description: "Optional human-readable session title" },
+        automationMode:      { type: "string",  enum: ["AUTO_CREATE_PR"], description: "Set to AUTO_CREATE_PR to have Jules automatically create a PR when done (no manual step needed)" },
         requirePlanApproval: { type: "boolean", description: "If true, Jules pauses for your approval before writing code (default: false)" },
       },
       required: ["prompt", "source"],
@@ -182,7 +160,7 @@ const TOOLS = [
   },
   {
     name: "jules_quick_session",
-    description: "One-shot shortcut: pick a template + repo name substring and instantly create a session. Ideal for common recurring tasks.",
+    description: "One-shot shortcut: pick a template + repo name substring and instantly create a session. Ideal for common recurring tasks. Set automationMode to AUTO_CREATE_PR for hands-free operation.",
     inputSchema: {
       type: "object",
       properties: {
@@ -190,23 +168,10 @@ const TOOLS = [
         sourceFilter:        { type: "string", description: "Substring to identify the repo (e.g. 'myorg/myrepo'). Must match exactly one source." },
         startingBranch:      { type: "string", description: "Branch to start from (optional)" },
         customPrompt:        { type: "string", description: "Override the template prompt with custom instructions" },
+        automationMode:      { type: "string",  enum: ["AUTO_CREATE_PR"], description: "Set to AUTO_CREATE_PR to auto-create a PR when done" },
         requirePlanApproval: { type: "boolean", description: "Require plan approval before coding starts (default: false)" },
       },
       required: ["template", "sourceFilter"],
-    },
-  },
-  {
-    name: "jules_build_session_prompt",
-    description: "Preview or customise a built-in session template without creating a session. Returns title + prompt ready for jules_create_session.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        template:            { type: "string", enum: Object.keys(SESSION_TEMPLATES), description: "Template to build from" },
-        customTitle:         { type: "string", description: "Override the default template title" },
-        customPrompt:        { type: "string", description: "Override the default template prompt" },
-        requirePlanApproval: { type: "boolean", description: "Whether to recommend plan approval (default: true)" },
-      },
-      required: ["template"],
     },
   },
   {
@@ -338,20 +303,6 @@ const TOOLS = [
     },
   },
   {
-    name: "jules_list_activities_filtered",
-    description: "List session activities filtered by type (e.g. only ACTIVITY_COMPLETED events). Useful for extracting just the agent messages.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        sessionId:    { type: "string",  description: "Session identifier" },
-        pageSize:     { type: "integer", minimum: 1, maximum: 100, description: "Results per page (default: 30)" },
-        pageToken:    { type: "string",  description: "Pagination token" },
-        activityType: { type: "string",  description: "Filter by activity type string (e.g. ACTIVITY_COMPLETED, ACTIVITY_FAILED, ACTIVITY_STARTED)" },
-      },
-      required: ["sessionId"],
-    },
-  },
-  {
     name: "jules_get_latest_activity",
     description: "Get only the single most recent activity from a session — the last thing Jules said or did.",
     inputSchema: {
@@ -379,18 +330,6 @@ const TOOLS = [
       type: "object",
       properties: { sessionId: { type: "string", description: "Session identifier awaiting plan approval" } },
       required: ["sessionId"],
-    },
-  },
-  {
-    name: "jules_rename_session",
-    description: "Update the title of an existing session.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        sessionId: { type: "string", description: "Session identifier" },
-        newTitle:  { type: "string", description: "New title to assign to the session" },
-      },
-      required: ["sessionId", "newTitle"],
     },
   },
   {
@@ -477,18 +416,6 @@ async function runTool(apiKey, name, args) {
       }
     }
 
-    case "jules_describe_error": {
-      const { httpStatus, apiStatus, message } = args;
-      const catalog = ERROR_CATALOG[httpStatus] ?? {};
-      return ok({
-        httpStatus: httpStatus ?? "unknown",
-        apiStatus:  apiStatus  ?? "unknown",
-        originalMessage: message ?? "(none)",
-        suggestion:  catalog.suggestion  ?? "Check the Jules API docs or try again.",
-        retryable:   catalog.retryable   ?? false,
-      });
-    }
-
     case "jules_list_sources": {
       const { pageSize = 20, pageToken, filter } = args;
       const result = await julesRequest(apiKey, { path: "/sources", query: { pageSize, pageToken } });
@@ -509,12 +436,13 @@ async function runTool(apiKey, name, args) {
     }
 
     case "jules_create_session": {
-      const { prompt, source, startingBranch, title, requirePlanApproval } = args;
+      const { prompt, source, startingBranch, title, automationMode, requirePlanApproval } = args;
       if (!prompt) throw new Error("prompt is required");
       if (!source) throw new Error("source is required");
       const normalizedSource = source.startsWith("sources/") ? source : `sources/${source}`;
       const body = { prompt, sourceContext: { source: normalizedSource } };
       if (title) body.title = title;
+      if (automationMode) body.automationMode = automationMode;
       if (typeof requirePlanApproval === "boolean") body.requirePlanApproval = requirePlanApproval;
       const branches = startingBranch ? [startingBranch] : [undefined, "main", "master"];
       let lastErr;
@@ -532,7 +460,7 @@ async function runTool(apiKey, name, args) {
     }
 
     case "jules_quick_session": {
-      const { template, sourceFilter, startingBranch, customPrompt, requirePlanApproval = false } = args;
+      const { template, sourceFilter, startingBranch, customPrompt, automationMode, requirePlanApproval = false } = args;
       if (!template) throw new Error("template is required");
       if (!sourceFilter) throw new Error("sourceFilter is required");
       const tmpl = SESSION_TEMPLATES[template];
@@ -545,6 +473,7 @@ async function runTool(apiKey, name, args) {
       const source = matched[0];
       const sourceId = source?.name || (source?.id ? `sources/${source.id}` : undefined);
       const body = { prompt: customPrompt || tmpl.prompt, title: tmpl.title, requirePlanApproval, sourceContext: { source: sourceId } };
+      if (automationMode) body.automationMode = automationMode;
       const branches = startingBranch ? [startingBranch] : [undefined, "main", "master"];
       let lastErr;
       for (const branch of branches) {
@@ -559,19 +488,6 @@ async function runTool(apiKey, name, args) {
         }
       }
       throw lastErr;
-    }
-
-    case "jules_build_session_prompt": {
-      const { template, customTitle, customPrompt, requirePlanApproval = true } = args;
-      const tmpl = SESSION_TEMPLATES[template];
-      if (!tmpl) throw new Error(`Unknown template: ${template}. Available: ${Object.keys(SESSION_TEMPLATES).join(", ")}`);
-      return ok({
-        template,
-        title: customTitle || tmpl.title,
-        prompt: customPrompt || tmpl.prompt,
-        requirePlanApproval,
-        hint: "Pass title and prompt directly to jules_create_session or jules_quick_session.",
-      });
     }
 
     case "jules_clone_session": {
@@ -724,19 +640,6 @@ async function runTool(apiKey, name, args) {
       }));
     }
 
-    case "jules_list_activities_filtered": {
-      const { sessionId, pageSize = 30, pageToken, activityType } = args;
-      if (!sessionId) throw new Error("sessionId is required");
-      const result = await julesRequest(apiKey, {
-        path: `/sessions/${encodeURIComponent(sessionId)}/activities`,
-        query: { pageSize, pageToken },
-      });
-      if (!activityType) return ok(result);
-      const filtered = (Array.isArray(result?.activities) ? result.activities : [])
-        .filter(a => String(a?.activityType ?? a?.type ?? "").toUpperCase().includes(activityType.toUpperCase()));
-      return ok({ ...result, activities: filtered, _filteredBy: activityType, _filteredCount: filtered.length });
-    }
-
     case "jules_get_latest_activity": {
       const { sessionId } = args;
       if (!sessionId) throw new Error("sessionId is required");
@@ -762,18 +665,6 @@ async function runTool(apiKey, name, args) {
       if (!sessionId) throw new Error("sessionId is required");
       return ok(await julesRequest(apiKey, {
         method: "POST", path: `/sessions/${encodeURIComponent(sessionId)}:approvePlan`, body: {},
-      }));
-    }
-
-    case "jules_rename_session": {
-      const { sessionId, newTitle } = args;
-      if (!sessionId) throw new Error("sessionId is required");
-      if (!newTitle)  throw new Error("newTitle is required");
-      return ok(await julesRequest(apiKey, {
-        method: "PATCH",
-        path: `/sessions/${encodeURIComponent(sessionId)}`,
-        query: { updateMask: "title" },
-        body: { title: newTitle },
       }));
     }
 
