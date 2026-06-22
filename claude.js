@@ -49,9 +49,7 @@ function buildNodeReq(request, url) {
   for (const [k, v] of request.headers.entries()) {
     headers[k.toLowerCase()] = v;
   }
-  if (!headers["accept"]) {
-    headers["accept"] = "application/json, text/event-stream";
-  }
+  headers["accept"] = "application/json, text/event-stream";
   return {
     method: request.method,
     url: url.pathname + url.search,
@@ -102,20 +100,6 @@ function buildNodeRes() {
       ended = true;
       if (data) chunks.push(typeof data === "string" ? data : new TextDecoder().decode(data));
       const body = chunks.join("");
-      const contentType = responseHeaders["content-type"] ?? "";
-
-      // If the SDK returned SSE with a single event, convert to plain JSON
-      // so clients that expect application/json can parse it.
-      if (contentType.includes("text/event-stream")) {
-        const jsonBody = extractSingleSseJson(body);
-        if (jsonBody !== null) {
-          responseHeaders["content-type"] = "application/json";
-          delete responseHeaders["cache-control"];
-          resolveResponse(new Response(jsonBody, { status: statusCode, headers: responseHeaders }));
-          return;
-        }
-      }
-
       resolveResponse(new Response(body || null, { status: statusCode, headers: responseHeaders }));
     },
 
@@ -123,29 +107,6 @@ function buildNodeRes() {
   };
 
   return { res, promise, emitter };
-}
-
-// ---------------------------------------------------------------------------
-// SSE-to-JSON conversion for single-event responses
-// ---------------------------------------------------------------------------
-
-function extractSingleSseJson(body) {
-  const dataLines = [];
-  for (const line of body.split("\n")) {
-    const trimmed = line.trim();
-    if (trimmed.startsWith("data:")) {
-      dataLines.push(trimmed.slice(5).trim());
-    }
-  }
-  if (dataLines.length === 1) {
-    try {
-      JSON.parse(dataLines[0]);
-      return dataLines[0];
-    } catch {
-      return null;
-    }
-  }
-  return null;
 }
 
 // ---------------------------------------------------------------------------
