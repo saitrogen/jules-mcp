@@ -183,6 +183,7 @@ const TOOLS = [
         sessionId:           { type: "string",  description: "ID of the session to clone" },
         newTitle:            { type: "string",  description: "Title for the new cloned session" },
         newPrompt:           { type: "string",  description: "Override the original prompt (optional)" },
+        automationMode:      { type: "string",  enum: ["AUTO_CREATE_PR"], description: "Set to AUTO_CREATE_PR to auto-create a PR when done" },
         requirePlanApproval: { type: "boolean", description: "Require plan approval on the new session (default: false)" },
       },
       required: ["sessionId"],
@@ -348,7 +349,6 @@ const TOOLS = [
       type: "object",
       properties: {
         sessionIds:      { type: "array", items: { type: "string" }, description: "Array of session IDs to delete" },
-        continueOnError: { type: "boolean", description: "If true, continue deleting even if one fails (default: true)" },
       },
       required: ["sessionIds"],
     },
@@ -491,7 +491,7 @@ async function runTool(apiKey, name, args) {
     }
 
     case "jules_clone_session": {
-      const { sessionId, newTitle, newPrompt, requirePlanApproval = false } = args;
+      const { sessionId, newTitle, newPrompt, automationMode, requirePlanApproval = false } = args;
       if (!sessionId) throw new Error("sessionId is required");
       const orig = await julesRequest(apiKey, { path: `/sessions/${encodeURIComponent(sessionId)}` });
       const origSource = orig?.sourceContext?.source;
@@ -503,6 +503,7 @@ async function runTool(apiKey, name, args) {
         requirePlanApproval,
         sourceContext: { source: origSource },
       };
+      if (automationMode) body.automationMode = automationMode;
       if (origBranch) body.sourceContext.githubRepoContext = { startingBranch: origBranch };
       const newSession = await julesRequest(apiKey, { method: "POST", path: "/sessions", body });
       return ok({ ...newSession, _clonedFrom: sessionId });
@@ -619,7 +620,7 @@ async function runTool(apiKey, name, args) {
         const pageSessions = Array.isArray(page.sessions) ? page.sessions : [];
         for (const s of pageSessions) {
           if (scanned >= maxSessions) break;
-          if (sourceFilter && !sourceMatchesFilter(s?.sourceContext, sourceFilter)) { scanned++; continue; }
+          if (sourceFilter && !(s?.sourceContext?.source || "").toLowerCase().includes(sourceFilter.toLowerCase())) { scanned++; continue; }
           const { pullRequests } = extractOutputs(s);
           if (pullRequests.length > 0) {
             withPRs.push({ id: s?.id, title: s?.title, state: s?.state, source: s?.sourceContext?.source, pullRequests, updateTime: s?.updateTime });
