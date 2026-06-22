@@ -24,7 +24,7 @@
  */
 
 const SERVER_NAME    = "jules-mcp";
-const SERVER_VERSION = "3.0.0";
+const SERVER_VERSION = "3.1.0";
 const PROTO_V        = "2025-03-26";
 const JULES_BASE     = "https://jules.googleapis.com/v1alpha";
 
@@ -353,6 +353,33 @@ const TOOLS = [
       required: ["sessionIds"],
     },
   },
+  {
+    name: "jules_archive_session",
+    description: "Archive a Jules session. Archived sessions are hidden from default listings but not deleted.",
+    inputSchema: {
+      type: "object",
+      properties: { sessionId: { type: "string", description: "Session identifier to archive" } },
+      required: ["sessionId"],
+    },
+  },
+  {
+    name: "jules_unarchive_session",
+    description: "Unarchive a previously archived Jules session, making it visible in default listings again.",
+    inputSchema: {
+      type: "object",
+      properties: { sessionId: { type: "string", description: "Session identifier to unarchive" } },
+      required: ["sessionId"],
+    },
+  },
+  {
+    name: "jules_get_activity",
+    description: "Get a single activity by its full resource name. Use when you need details on a specific activity event.",
+    inputSchema: {
+      type: "object",
+      properties: { activityName: { type: "string", description: "Full activity resource name, e.g. sessions/123/activities/456" } },
+      required: ["activityName"],
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -381,7 +408,7 @@ function extractOutputs(session) {
 function sanitizeSession(session, { compact, includePrompt, includeOutputs, includeSourceContext, maxPromptChars } = {}) {
   if (!compact && includePrompt === undefined && includeOutputs === undefined && includeSourceContext === undefined && !maxPromptChars) return session;
   const s = compact
-    ? { name: session?.name, id: session?.id, title: session?.title, state: session?.state, createTime: session?.createTime, updateTime: session?.updateTime, url: session?.url }
+    ? { name: session?.name, id: session?.id, title: session?.title, state: session?.state, archived: session?.archived, createTime: session?.createTime, updateTime: session?.updateTime, url: session?.url }
     : { ...session };
   const wantPrompt  = compact ? false : (includePrompt  !== false);
   const wantOutputs = compact ? false : (includeOutputs !== false);
@@ -581,7 +608,7 @@ async function runTool(apiKey, name, args) {
       const { sessionId } = args;
       if (!sessionId) throw new Error("sessionId is required");
       const s = await julesRequest(apiKey, { path: `/sessions/${encodeURIComponent(sessionId)}` });
-      return ok({ id: s?.id, name: s?.name, title: s?.title, state: s?.state, createTime: s?.createTime, updateTime: s?.updateTime });
+      return ok({ id: s?.id, name: s?.name, title: s?.title, state: s?.state, archived: s?.archived, createTime: s?.createTime, updateTime: s?.updateTime });
     }
 
     case "jules_session_summary": {
@@ -725,6 +752,32 @@ async function runTool(apiKey, name, args) {
       const succeeded = report.filter(r => r?.deleted).length;
       const failed    = report.filter(r => !r?.deleted).length;
       return ok({ total: sessionIds.length, succeeded, failed, results: report });
+    }
+
+    case "jules_archive_session": {
+      const { sessionId } = args;
+      if (!sessionId) throw new Error("sessionId is required");
+      await julesRequest(apiKey, {
+        method: "POST", path: `/sessions/${encodeURIComponent(sessionId)}:archive`, body: {},
+      });
+      return ok({ archived: true, sessionId });
+    }
+
+    case "jules_unarchive_session": {
+      const { sessionId } = args;
+      if (!sessionId) throw new Error("sessionId is required");
+      await julesRequest(apiKey, {
+        method: "POST", path: `/sessions/${encodeURIComponent(sessionId)}:unarchive`, body: {},
+      });
+      return ok({ unarchived: true, sessionId });
+    }
+
+    case "jules_get_activity": {
+      const { activityName } = args;
+      if (!activityName) throw new Error("activityName is required");
+      const raw = activityName.startsWith("sessions/") ? activityName : `sessions/${activityName}`;
+      const activity = await julesRequest(apiKey, { path: `/${raw}` });
+      return ok(activity);
     }
 
     default:
