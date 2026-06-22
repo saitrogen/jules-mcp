@@ -272,7 +272,7 @@ const TOOLS = [
       type: "object",
       properties: {
         sessionId:  { type: "string", description: "Session identifier" },
-        outputType: { type: "string", enum: ["pullRequest","files","all"], description: "What to extract (default: all)" },
+        outputType: { type: "string", enum: ["pullRequest","files","changeSets","all"], description: "What to extract (default: all)" },
       },
       required: ["sessionId"],
     },
@@ -369,12 +369,13 @@ function withCanonical(source) {
 }
 
 function extractOutputs(session) {
-  const prs = [], files = [];
+  const prs = [], files = [], changeSets = [];
   for (const out of session?.outputs ?? []) {
     if (out?.pullRequest) prs.push(out.pullRequest);
     if (Array.isArray(out?.files)) files.push(...out.files);
+    if (out?.changeSet) changeSets.push(out.changeSet);
   }
-  return { pullRequests: prs, files };
+  return { pullRequests: prs, files, changeSets };
 }
 
 function sanitizeSession(session, { compact, includePrompt, includeOutputs, includeSourceContext, maxPromptChars } = {}) {
@@ -392,6 +393,24 @@ function sanitizeSession(session, { compact, includePrompt, includeOutputs, incl
   if (!wantOutputs) delete s.outputs;
   if (!wantSource)  delete s.sourceContext;
   return s;
+}
+
+// ponytail: strip heavy nested fields from activities, keep shape useful for agents
+function slimActivity(a) {
+  if (!a || typeof a !== "object") return a;
+  const slim = { id: a.id, createTime: a.createTime, originator: a.originator };
+  if (a.planGenerated) slim.type = "planGenerated";
+  else if (a.planApproved) slim.type = "planApproved";
+  else if (a.sessionCompleted) slim.type = "sessionCompleted";
+  else if (a.progressUpdated) {
+    slim.type = "progressUpdated";
+    const msg = a.progressUpdated?.agentMessage?.content;
+    if (msg) slim.message = msg.length > 300 ? msg.slice(0, 300) + "…" : msg;
+  }
+  else if (a.userMessage) slim.type = "userMessage";
+  else slim.type = Object.keys(a).find(k => !["name","createTime","originator","id"].includes(k)) ?? "unknown";
+  if (a.artifacts) slim.artifactCount = Array.isArray(a.artifacts) ? a.artifacts.length : 1;
+  return slim;
 }
 
 function sourceMatchesFilter(source, query) {
@@ -418,10 +437,22 @@ async function runTool(apiKey, name, args) {
 
     case "jules_list_sources": {
       const { pageSize = 20, pageToken, filter } = args;
+      if (filter) {
+        // ponytail: paginate all sources before filtering, cap at 5 pages to avoid runaway
+        const all = [];
+        let token = pageToken;
+        for (let page = 0; page < 5; page++) {
+          const result = await julesRequest(apiKey, { path: "/sources", query: { pageSize: 100, pageToken: token } });
+          if (Array.isArray(result.sources)) all.push(...result.sources);
+          token = result.nextPageToken;
+          if (!token) break;
+        }
+        const sources = all.map(withCanonical).filter(s => sourceMatchesFilter(s, filter));
+        return ok({ sources, total: sources.length });
+      }
       const result = await julesRequest(apiKey, { path: "/sources", query: { pageSize, pageToken } });
-      let sources = Array.isArray(result.sources) ? result.sources.map(withCanonical) : [];
-      if (filter) sources = sources.filter(s => sourceMatchesFilter(s, filter));
-      return ok({ ...result, sources, total: sources.length });
+      const sources = Array.isArray(result.sources) ? result.sources.map(withCanonical) : [];
+      return ok({ sources, total: sources.length, nextPageToken: result.nextPageToken });
     }
 
     case "jules_get_source": {
@@ -514,7 +545,7 @@ async function runTool(apiKey, name, args) {
       const sessions_ = Array.isArray(result.sessions)
         ? result.sessions.map(s => sanitizeSession(s, { compact, includePrompt, includeOutputs, includeSourceContext, maxPromptChars }))
         : [];
-      return ok({ ...result, sessions: sessions_, total: sessions_.length });
+      return ok({ sessions: sessions_, pageCount: sessions_.length, nextPageToken: result.nextPageToken });
     }
 
     case "jules_list_sessions_by_state": {
@@ -558,10 +589,10 @@ async function runTool(apiKey, name, args) {
       if (!sessionId) throw new Error("sessionId is required");
       const [session, activitiesPage] = await Promise.all([
         julesRequest(apiKey, { path: `/sessions/${encodeURIComponent(sessionId)}` }),
-        julesRequest(apiKey, { path: `/sessions/${encodeURIComponent(sessionId)}/activities`, query: { pageSize: 5 } }),
+        julesRequest(apiKey, { path: `/sessions/${encodeURIComponent(sessionId)}/activities`, query: { pageSize: 100 } }),
       ]);
       const activities = Array.isArray(activitiesPage?.activities) ? activitiesPage.activities : [];
-      const { pullRequests, files } = extractOutputs(session);
+      const { pullRequests, files, changeSets } = extractOutputs(session);
       return ok({
         id:          session?.id,
         title:       session?.title,
@@ -571,9 +602,10 @@ async function runTool(apiKey, name, args) {
         createTime:  session?.createTime,
         updateTime:  session?.updateTime,
         promptSnippet: typeof session?.prompt === "string" ? session.prompt.slice(0, 200) + (session.prompt.length > 200 ? "…" : "") : undefined,
-        latestActivity: activities[0] ?? null,
-        activityCount: activitiesPage?.totalSize ?? activities.length,
-        outputs: { pullRequests, fileCount: files.length },
+        latestActivity: slimActivity(activities[activities.length - 1]) ?? null,
+        activityCount: activities.length,
+        hasMoreActivities: !!activitiesPage?.nextPageToken,
+        outputs: { pullRequests, fileCount: files.length, changeSets },
       });
     }
 
@@ -602,10 +634,11 @@ async function runTool(apiKey, name, args) {
       const { sessionId, outputType = "all" } = args;
       if (!sessionId) throw new Error("sessionId is required");
       const session = await julesRequest(apiKey, { path: `/sessions/${encodeURIComponent(sessionId)}` });
-      const { pullRequests, files } = extractOutputs(session);
+      const { pullRequests, files, changeSets } = extractOutputs(session);
       const result = { sessionId, state: session?.state };
       if (outputType === "pullRequest" || outputType === "all") result.pullRequests = pullRequests;
       if (outputType === "files"       || outputType === "all") result.files = files;
+      if (outputType === "changeSets"  || outputType === "all") result.changeSets = changeSets;
       return ok(result);
     }
 
@@ -634,10 +667,12 @@ async function runTool(apiKey, name, args) {
     case "jules_list_activities": {
       const { sessionId, pageSize = 30, pageToken } = args;
       if (!sessionId) throw new Error("sessionId is required");
-      return ok(await julesRequest(apiKey, {
+      const result = await julesRequest(apiKey, {
         path: `/sessions/${encodeURIComponent(sessionId)}/activities`,
         query: { pageSize, pageToken },
-      }));
+      });
+      const activities = Array.isArray(result?.activities) ? result.activities.map(slimActivity) : [];
+      return ok({ activities, pageCount: activities.length, nextPageToken: result?.nextPageToken });
     }
 
     case "jules_get_latest_activity": {
@@ -645,10 +680,10 @@ async function runTool(apiKey, name, args) {
       if (!sessionId) throw new Error("sessionId is required");
       const result = await julesRequest(apiKey, {
         path: `/sessions/${encodeURIComponent(sessionId)}/activities`,
-        query: { pageSize: 5 },
+        query: { pageSize: 100 },
       });
       const activities = Array.isArray(result?.activities) ? result.activities : [];
-      return ok({ sessionId, latestActivity: activities[0] ?? null, totalActivities: result?.totalSize ?? activities.length });
+      return ok({ sessionId, latestActivity: slimActivity(activities[activities.length - 1]) ?? null, totalActivities: activities.length });
     }
 
     case "jules_send_message": {
@@ -663,15 +698,17 @@ async function runTool(apiKey, name, args) {
     case "jules_approve_plan": {
       const { sessionId } = args;
       if (!sessionId) throw new Error("sessionId is required");
-      return ok(await julesRequest(apiKey, {
+      await julesRequest(apiKey, {
         method: "POST", path: `/sessions/${encodeURIComponent(sessionId)}:approvePlan`, body: {},
-      }));
+      });
+      return ok({ approved: true, sessionId, message: "Plan approved. Jules will now begin coding." });
     }
 
     case "jules_delete_session": {
       const { sessionId } = args;
       if (!sessionId) throw new Error("sessionId is required");
-      return ok(await julesRequest(apiKey, { method: "DELETE", path: `/sessions/${encodeURIComponent(sessionId)}` }));
+      await julesRequest(apiKey, { method: "DELETE", path: `/sessions/${encodeURIComponent(sessionId)}` });
+      return ok({ deleted: true, sessionId });
     }
 
     case "jules_bulk_delete_sessions": {
