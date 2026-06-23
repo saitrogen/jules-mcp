@@ -1,3 +1,9 @@
+/**
+ * This file contains tests for utility and helper functions used by the Claude MCP server,
+ * such as output extraction, session sanitization, activity slimming, and source filtering.
+ * You can execute these tests by running `deno task test` in the project root.
+ */
+
 import { assertEquals, assert } from "https://deno.land/std/assert/mod.ts";
 import { extractOutputs, sanitizeSession, slimActivity, sourceMatchesFilter } from "../claude.js";
 
