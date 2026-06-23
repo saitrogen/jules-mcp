@@ -291,23 +291,13 @@ const TOOLS = [
   },
   {
     name: "jules_list_activities",
-    description: "List all activity events for a session — Jules' step-by-step log of what it is doing.",
+    description: "Check what Jules is doing. Default: current heartbeat only. Use mode=timeline for the full phase-by-phase story.",
     inputSchema: {
       type: "object",
       properties: {
         sessionId: { type: "string",  description: "Session identifier" },
-        pageSize:  { type: "integer", minimum: 1, maximum: 100, description: "Results per page (default: 30)" },
-        pageToken: { type: "string",  description: "Pagination token" },
+        mode:      { type: "string",  enum: ["latest", "timeline"], description: "latest (default): just the current heartbeat. timeline: grouped phases + current." },
       },
-      required: ["sessionId"],
-    },
-  },
-  {
-    name: "jules_get_latest_activity",
-    description: "Get only the single most recent activity from a session — the last thing Jules said or did.",
-    inputSchema: {
-      type: "object",
-      properties: { sessionId: { type: "string", description: "Session identifier" } },
       required: ["sessionId"],
     },
   },
@@ -744,35 +734,17 @@ async function runTool(apiKey, name, args) {
     }
 
     case "jules_list_activities": {
-      const { sessionId, pageSize = 100, pageToken } = args;
-      if (!sessionId) throw new Error("sessionId is required");
-      const [session, result] = await Promise.all([
-        julesRequest(apiKey, { path: `/sessions/${encodeURIComponent(sessionId)}` }),
-        julesRequest(apiKey, { path: `/sessions/${encodeURIComponent(sessionId)}/activities`, query: { pageSize, pageToken } }),
-      ]);
-      const activities = Array.isArray(result?.activities) ? result.activities : [];
-      const timeline = buildTimeline(activities, session?.createTime);
-      if (result?.nextPageToken) timeline.nextPageToken = result.nextPageToken;
-      return ok(timeline);
-    }
-
-    case "jules_get_latest_activity": {
-      const { sessionId } = args;
+      const { sessionId, mode = "latest" } = args;
       if (!sessionId) throw new Error("sessionId is required");
       const [session, result] = await Promise.all([
         julesRequest(apiKey, { path: `/sessions/${encodeURIComponent(sessionId)}` }),
         julesRequest(apiKey, { path: `/sessions/${encodeURIComponent(sessionId)}/activities`, query: { pageSize: 100 } }),
       ]);
       const activities = Array.isArray(result?.activities) ? result.activities : [];
-      const last = activities[activities.length - 1];
-      if (!last) return ok({ current: null, totalSteps: 0 });
-      const base = new Date(session?.createTime || last.createTime).getTime();
-      const at = `+${Math.round((new Date(last.createTime).getTime() - base) / 60000)}m`;
-      const slim = slimActivity(last);
-      const current = { type: slim?.type, at };
-      if (slim?.artifactCount) current.artifacts = slim.artifactCount;
-      if (slim?.originator === "user") current.by = "user";
-      return ok({ current, totalSteps: activities.length });
+      const timeline = buildTimeline(activities, session?.createTime);
+      if (mode === "latest") return ok({ current: timeline.current, totalSteps: timeline.count });
+      if (result?.nextPageToken) timeline.nextPageToken = result.nextPageToken;
+      return ok(timeline);
     }
 
     case "jules_send_message": {
