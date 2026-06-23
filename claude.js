@@ -620,20 +620,26 @@ async function runTool(apiKey, name, args) {
       ]);
       const activities = Array.isArray(activitiesPage?.activities) ? activitiesPage.activities : [];
       const { pullRequests, files, changeSets } = extractOutputs(session);
-      return ok({
-        id:          session?.id,
-        title:       session?.title,
-        state:       session?.state,
-        source:      session?.sourceContext?.source,
-        branch:      session?.sourceContext?.githubRepoContext?.startingBranch,
-        createTime:  session?.createTime,
-        updateTime:  session?.updateTime,
-        promptSnippet: typeof session?.prompt === "string" ? session.prompt.slice(0, 200) + (session.prompt.length > 200 ? "…" : "") : undefined,
-        latestActivity: slimActivity(activities[activities.length - 1]) ?? null,
-        activityCount: activities.length,
-        hasMoreActivities: !!activitiesPage?.nextPageToken,
-        outputs: { pullRequests, fileCount: files.length, changeSets },
-      });
+      const created = new Date(session?.createTime);
+      const updated = new Date(session?.updateTime);
+      const durationMin = Math.round((updated - created) / 60000);
+      const rawSource = session?.sourceContext?.source ?? "";
+      const summary = {
+        title:    session?.title,
+        state:    session?.state,
+        repo:     rawSource.replace(/^sources\/github\//, ""),
+        branch:   session?.sourceContext?.githubRepoContext?.startingBranch,
+        duration: `${durationMin}m`,
+        prompt:   typeof session?.prompt === "string" ? session.prompt.slice(0, 200) + (session.prompt.length > 200 ? "…" : "") : undefined,
+        lastAction: activities.length > 0 ? (slimActivity(activities[activities.length - 1])?.type ?? null) : null,
+        steps:    activities.length,
+      };
+      if (pullRequests.length > 0) summary.prs = pullRequests.map(pr => ({ url: pr.url, title: pr.title }));
+      if (changeSets.length > 0) summary.commits = changeSets.map(cs => cs.gitPatch?.suggestedCommitMessage).filter(Boolean);
+      if (files.length > 0) summary.fileCount = files.length;
+      if (activitiesPage?.nextPageToken) summary.hasMoreSteps = true;
+      if (session?.url) summary.url = session.url;
+      return ok(summary);
     }
 
     case "jules_wait_for_session": {
