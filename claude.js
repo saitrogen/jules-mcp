@@ -96,19 +96,6 @@ async function julesRequest(apiKey, { method = "GET", path, query, body }) {
 const SESSION_STATES = ["QUEUED","PLANNING","AWAITING_PLAN_APPROVAL","AWAITING_USER_FEEDBACK","IN_PROGRESS","PAUSED","COMPLETED","FAILED"];
 const TERMINAL_STATES = ["COMPLETED","FAILED"];
 
-const SESSION_TEMPLATES = {
-  add_tests:      { title: "Add tests",             prompt: "Add comprehensive unit tests for the existing code. Include tests for happy path and edge cases." },
-  fix_bug:        { title: "Fix bug",               prompt: "Identify and fix the bug described. Include a test that verifies the fix. Minimal changes only." },
-  refactor:       { title: "Refactor for clarity",  prompt: "Refactor the code for better readability and maintainability. Keep functionality unchanged." },
-  review:         { title: "Code review",           prompt: "Review the code for best practices, performance issues, and security concerns. Suggest improvements." },
-  add_docs:       { title: "Add documentation",     prompt: "Add clear documentation, comments, and docstrings to the code. Focus on intent and usage." },
-  add_types:      { title: "Add TypeScript types",  prompt: "Add TypeScript type annotations. Ensure all functions, parameters, and return values are typed. Do not change runtime logic." },
-  security_audit: { title: "Security audit",        prompt: "Audit the codebase for security vulnerabilities: injection risks, exposed secrets, insecure dependencies, improper auth, and unsafe defaults. List issues with severity ratings." },
-  add_ci:         { title: "Add CI workflow",       prompt: "Add a GitHub Actions CI workflow that runs tests and linting on every push and pull request to main." },
-  upgrade_deps:   { title: "Upgrade dependencies",  prompt: "Identify outdated dependencies and upgrade them to their latest stable versions. Run tests to confirm nothing broke." },
-  add_readme:     { title: "Write README",          prompt: "Write a comprehensive README.md covering: project purpose, installation, usage examples, configuration, and contributing guide." },
-};
-
 // ---------------------------------------------------------------------------
 // Tool definitions
 // ---------------------------------------------------------------------------
@@ -144,34 +131,19 @@ const TOOLS = [
   },
   {
     name: "jules_create_session",
-    description: "Create a new Jules AI coding session. Jules will plan and implement the task on the specified repository branch. Set automationMode to AUTO_CREATE_PR for fully autonomous operation.",
+    description: "Create a new Jules AI coding session. Jules will plan and implement the task on the specified repository branch. Provide either source (full path) or sourceFilter (substring matching exactly one repo). Set automationMode to AUTO_CREATE_PR for fully autonomous operation. NOTE: if requirePlanApproval is true, you must call jules_approve_plan within ~8 minutes or the session expires unworked.",
     inputSchema: {
       type: "object",
       properties: {
         prompt:              { type: "string",  description: "Detailed task instruction for Jules (be specific about what to build/fix/test)" },
         source:              { type: "string",  description: "Repository source, e.g. sources/github/myorg/myrepo" },
+        sourceFilter:        { type: "string",  description: "Substring to identify the repo (e.g. 'myrepo') instead of the full source path. Must match exactly one source." },
         startingBranch:      { type: "string",  description: "Branch to start from (e.g. main). Auto-detected if omitted." },
         title:               { type: "string",  description: "Optional human-readable session title" },
         automationMode:      { type: "string",  enum: ["AUTO_CREATE_PR"], description: "Set to AUTO_CREATE_PR to have Jules automatically create a PR when done (no manual step needed)" },
-        requirePlanApproval: { type: "boolean", description: "If true, Jules pauses for your approval before writing code (default: false)" },
+        requirePlanApproval: { type: "boolean", description: "If true, Jules pauses at AWAITING_PLAN_APPROVAL until you call jules_approve_plan (within ~8 min, else it expires)" },
       },
-      required: ["prompt", "source"],
-    },
-  },
-  {
-    name: "jules_quick_session",
-    description: "One-shot shortcut: pick a template + repo name substring and instantly create a session. Ideal for common recurring tasks. Set automationMode to AUTO_CREATE_PR for hands-free operation.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        template:            { type: "string", enum: Object.keys(SESSION_TEMPLATES), description: "Preset task template name" },
-        sourceFilter:        { type: "string", description: "Substring to identify the repo (e.g. 'myorg/myrepo'). Must match exactly one source." },
-        startingBranch:      { type: "string", description: "Branch to start from (optional)" },
-        customPrompt:        { type: "string", description: "Override the template prompt with custom instructions" },
-        automationMode:      { type: "string",  enum: ["AUTO_CREATE_PR"], description: "Set to AUTO_CREATE_PR to auto-create a PR when done" },
-        requirePlanApproval: { type: "boolean", description: "Require plan approval before coding starts (default: false)" },
-      },
-      required: ["template", "sourceFilter"],
+      required: ["prompt"],
     },
   },
   {
@@ -530,10 +502,19 @@ async function runTool(apiKey, name, args) {
     }
 
     case "jules_create_session": {
-      const { prompt, source, startingBranch, title, automationMode, requirePlanApproval } = args;
+      const { prompt, source, sourceFilter, startingBranch, title, automationMode, requirePlanApproval } = args;
       if (!prompt) throw new Error("prompt is required");
-      if (!source) throw new Error("source is required");
-      const normalizedSource = source.startsWith("sources/") ? source : `sources/${source}`;
+      if (!source && !sourceFilter) throw new Error("provide either source or sourceFilter");
+      let normalizedSource;
+      if (source) {
+        normalizedSource = source.startsWith("sources/") ? source : `sources/${source}`;
+      } else {
+        const listResult = await julesRequest(apiKey, { path: "/sources", query: { pageSize: 100 } });
+        const matched = (Array.isArray(listResult.sources) ? listResult.sources : []).filter(s => sourceMatchesFilter(s, sourceFilter));
+        if (matched.length === 0) throw new Error(`No source matching '${sourceFilter}'. Run jules_list_sources to see available repositories.`);
+        if (matched.length > 1)  throw new Error(`Multiple sources match '${sourceFilter}': ${matched.map(s => s?.name || s?.id).join(", ")}. Be more specific.`);
+        normalizedSource = matched[0]?.name || `sources/${matched[0]?.id}`;
+      }
       const body = { prompt, sourceContext: { source: normalizedSource } };
       if (title) body.title = title;
       if (automationMode) body.automationMode = automationMode;
@@ -545,37 +526,6 @@ async function runTool(apiKey, name, args) {
           const payload = { ...body, sourceContext: { ...body.sourceContext } };
           if (branch) payload.sourceContext.githubRepoContext = { startingBranch: branch };
           return ok(await julesRequest(apiKey, { method: "POST", path: "/sessions", body: payload }));
-        } catch (e) {
-          lastErr = e;
-          if (!(e?.httpStatus === 400 && e?.apiStatus === "INVALID_ARGUMENT")) throw e;
-        }
-      }
-      throw lastErr;
-    }
-
-    case "jules_quick_session": {
-      const { template, sourceFilter, startingBranch, customPrompt, automationMode, requirePlanApproval = false } = args;
-      if (!template) throw new Error("template is required");
-      if (!sourceFilter) throw new Error("sourceFilter is required");
-      const tmpl = SESSION_TEMPLATES[template];
-      if (!tmpl) throw new Error(`Unknown template: ${template}. Available: ${Object.keys(SESSION_TEMPLATES).join(", ")}`);
-      const listResult = await julesRequest(apiKey, { path: "/sources", query: { pageSize: 100 } });
-      const allSources = Array.isArray(listResult.sources) ? listResult.sources : [];
-      const matched = allSources.filter(s => sourceMatchesFilter(s, sourceFilter));
-      if (matched.length === 0) throw new Error(`No source matching '${sourceFilter}'. Run jules_list_sources to see available repositories.`);
-      if (matched.length > 1)  throw new Error(`Multiple sources match '${sourceFilter}': ${matched.map(s => s?.name || s?.id).join(", ")}. Be more specific.`);
-      const source = matched[0];
-      const sourceId = source?.name || (source?.id ? `sources/${source.id}` : undefined);
-      const body = { prompt: customPrompt || tmpl.prompt, title: tmpl.title, requirePlanApproval, sourceContext: { source: sourceId } };
-      if (automationMode) body.automationMode = automationMode;
-      const branches = startingBranch ? [startingBranch] : [undefined, "main", "master"];
-      let lastErr;
-      for (const branch of branches) {
-        try {
-          const payload = { ...body, sourceContext: { ...body.sourceContext } };
-          if (branch) payload.sourceContext.githubRepoContext = { startingBranch: branch };
-          const session = await julesRequest(apiKey, { method: "POST", path: "/sessions", body: payload });
-          return ok({ ...session, _usedSource: sourceId, _template: template });
         } catch (e) {
           lastErr = e;
           if (!(e?.httpStatus === 400 && e?.apiStatus === "INVALID_ARGUMENT")) throw e;
