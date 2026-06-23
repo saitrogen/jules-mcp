@@ -970,8 +970,12 @@ async function handle(req) {
   return json({ error: "Not found" }, 404);
 }
 
-Deno.serve(handle);
-console.log(`\n🔧 ${SERVER_NAME} v${SERVER_VERSION} (Claude connector) — ${TOOLS.length} tools loaded`);
-console.log(`   ✅ MCP    → /mcp/<secret>   (Streamable HTTP, JSON responses)`);
-console.log(`   ✅ HEALTH → GET /health`);
-console.log(`   apiKey configured: ${Boolean(JULES_API_KEY)} | secret configured: ${Boolean(MCP_PATH_SECRET)}\n`);
+if (import.meta.main) {
+  Deno.serve(handle);
+  console.log(`\n🔧 ${SERVER_NAME} v${SERVER_VERSION} (Claude connector) — ${TOOLS.length} tools loaded`);
+  console.log(`   ✅ MCP    → /mcp/<secret>   (Streamable HTTP, JSON responses)`);
+  console.log(`   ✅ HEALTH → GET /health`);
+  console.log(`   apiKey configured: ${Boolean(JULES_API_KEY)} | secret configured: ${Boolean(MCP_PATH_SECRET)}\n`);
+}
+
+export { extractOutputs, sanitizeSession, slimActivity, sourceMatchesFilter };
