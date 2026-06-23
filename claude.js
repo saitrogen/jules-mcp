@@ -313,7 +313,7 @@ const TOOLS = [
   },
   {
     name: "jules_send_message",
-    description: "Send a follow-up instruction to an active Jules session — redirect it, add context, or ask it to revise.",
+    description: "Send a follow-up instruction to a Jules session (works on active or completed sessions). Completed sessions reactivate and continue working.",
     inputSchema: {
       type: "object",
       properties: {
@@ -438,6 +438,52 @@ function slimActivity(a) {
   else slim.type = Object.keys(a).find(k => !["name","createTime","originator","id"].includes(k)) ?? "unknown";
   if (a.artifacts) slim.artifactCount = Array.isArray(a.artifacts) ? a.artifacts.length : 1;
   return slim;
+}
+
+// ponytail: collapse activities into phase summaries + live heartbeat
+function buildTimeline(activities, sessionCreateTime) {
+  if (!activities.length) return { phases: [], current: null, count: 0 };
+  const base = new Date(sessionCreateTime || activities[0]?.createTime).getTime();
+  const relMin = (ts) => `+${Math.round((new Date(ts).getTime() - base) / 60000)}m`;
+  const typeOf = (a) => slimActivity(a)?.type ?? "unknown";
+
+  const phaseMap = {
+    planGenerated: "planning", planApproved: "planning",
+    sessionCompleted: "completed", sessionFailed: "failed",
+    userMessaged: "resumed",
+  };
+  const phases = [];
+  let cur = null;
+
+  for (const a of activities) {
+    const type = typeOf(a);
+    const phaseName = phaseMap[type] || "coding";
+    const at = relMin(a.createTime);
+    const hasArtifact = a.artifacts ? 1 : 0;
+
+    if (phaseName === "completed" || phaseName === "failed") {
+      if (cur) { cur.duration = `${Math.round((new Date(a.createTime).getTime() - new Date(cur._start).getTime()) / 60000)}m`; delete cur._start; phases.push(cur); cur = null; }
+      phases.push({ phase: phaseName, at });
+    } else if (phaseName === "resumed") {
+      if (cur) { delete cur._start; phases.push(cur); cur = null; }
+      phases.push({ phase: "resumed", at, trigger: type });
+    } else if (!cur || cur.phase !== phaseName) {
+      if (cur) { cur.duration = `${Math.round((new Date(a.createTime).getTime() - new Date(cur._start).getTime()) / 60000)}m`; delete cur._start; phases.push(cur); }
+      cur = { phase: phaseName, at, _start: a.createTime, steps: 1, artifacts: hasArtifact };
+    } else {
+      cur.steps++;
+      cur.artifacts += hasArtifact;
+    }
+  }
+  if (cur) { delete cur._start; phases.push(cur); }
+
+  const last = activities[activities.length - 1];
+  const slim = slimActivity(last);
+  const current = { type: slim?.type, at: relMin(last.createTime) };
+  if (slim?.artifactCount) current.artifacts = slim.artifactCount;
+  if (slim?.originator === "user") current.by = "user";
+
+  return { phases, current, count: activities.length };
 }
 
 function sourceMatchesFilter(source, query) {
@@ -698,25 +744,35 @@ async function runTool(apiKey, name, args) {
     }
 
     case "jules_list_activities": {
-      const { sessionId, pageSize = 30, pageToken } = args;
+      const { sessionId, pageSize = 100, pageToken } = args;
       if (!sessionId) throw new Error("sessionId is required");
-      const result = await julesRequest(apiKey, {
-        path: `/sessions/${encodeURIComponent(sessionId)}/activities`,
-        query: { pageSize, pageToken },
-      });
-      const activities = Array.isArray(result?.activities) ? result.activities.map(slimActivity) : [];
-      return ok({ activities, pageCount: activities.length, nextPageToken: result?.nextPageToken });
+      const [session, result] = await Promise.all([
+        julesRequest(apiKey, { path: `/sessions/${encodeURIComponent(sessionId)}` }),
+        julesRequest(apiKey, { path: `/sessions/${encodeURIComponent(sessionId)}/activities`, query: { pageSize, pageToken } }),
+      ]);
+      const activities = Array.isArray(result?.activities) ? result.activities : [];
+      const timeline = buildTimeline(activities, session?.createTime);
+      if (result?.nextPageToken) timeline.nextPageToken = result.nextPageToken;
+      return ok(timeline);
     }
 
     case "jules_get_latest_activity": {
       const { sessionId } = args;
       if (!sessionId) throw new Error("sessionId is required");
-      const result = await julesRequest(apiKey, {
-        path: `/sessions/${encodeURIComponent(sessionId)}/activities`,
-        query: { pageSize: 100 },
-      });
+      const [session, result] = await Promise.all([
+        julesRequest(apiKey, { path: `/sessions/${encodeURIComponent(sessionId)}` }),
+        julesRequest(apiKey, { path: `/sessions/${encodeURIComponent(sessionId)}/activities`, query: { pageSize: 100 } }),
+      ]);
       const activities = Array.isArray(result?.activities) ? result.activities : [];
-      return ok({ sessionId, latestActivity: slimActivity(activities[activities.length - 1]) ?? null, totalActivities: activities.length });
+      const last = activities[activities.length - 1];
+      if (!last) return ok({ current: null, totalSteps: 0 });
+      const base = new Date(session?.createTime || last.createTime).getTime();
+      const at = `+${Math.round((new Date(last.createTime).getTime() - base) / 60000)}m`;
+      const slim = slimActivity(last);
+      const current = { type: slim?.type, at };
+      if (slim?.artifactCount) current.artifacts = slim.artifactCount;
+      if (slim?.originator === "user") current.by = "user";
+      return ok({ current, totalSteps: activities.length });
     }
 
     case "jules_send_message": {
