@@ -96,6 +96,28 @@ async function julesRequest(apiKey, { method = "GET", path, query, body }) {
 const SESSION_STATES = ["QUEUED","PLANNING","AWAITING_PLAN_APPROVAL","AWAITING_USER_FEEDBACK","IN_PROGRESS","PAUSED","COMPLETED","FAILED"];
 const TERMINAL_STATES = ["COMPLETED","FAILED"];
 
+// Workflow guide surfaced to MCP clients on initialize, so a fresh agent knows
+// how the tools fit together (not just what each one does in isolation).
+const SERVER_INSTRUCTIONS = `Jules is an async AI coding agent. Typical workflow:
+
+1. DISCOVER: jules_list_sources to find a connected repo (or jules_get_source for branches).
+2. START: jules_create_session with a detailed prompt + source (or sourceFilter substring).
+   Set automationMode:"AUTO_CREATE_PR" to have Jules open a PR automatically.
+   Write the prompt like an instruction; include scope guardrails (e.g. "only modify X").
+3. MONITOR (Jules runs for minutes): jules_list_activities (default mode=latest) for a quick
+   heartbeat, or mode=timeline for the phase-by-phase story. jules_session_summary gives the
+   best one-call overview (state + last action + any PRs/commits).
+4. COLLECT: when state is COMPLETED, jules_get_session_output for PR URLs / diffs / changeSets.
+
+Status tools, cheapest to richest: jules_get_session_state < jules_list_activities (latest)
+< jules_session_summary < jules_get_session.
+
+Plan approval: if requirePlanApproval:true, the session pauses at AWAITING_PLAN_APPROVAL;
+call jules_approve_plan within ~8 minutes or it expires unworked.
+
+Follow-ups: jules_send_message redirects a running session (and reactivates a COMPLETED one).
+Cleanup: jules_delete_session / jules_bulk_delete_sessions; jules_archive_session to hide.`;
+
 // ---------------------------------------------------------------------------
 // Tool definitions
 // ---------------------------------------------------------------------------
@@ -783,6 +805,7 @@ async function dispatch(apiKey, rpc) {
             protocolVersion: rpc?.params?.protocolVersion ?? PROTO_V,
             capabilities: { tools: {} },
             serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
+            instructions: SERVER_INSTRUCTIONS,
           },
         };
 
