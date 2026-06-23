@@ -154,7 +154,7 @@ holds nothing between requests.
 Verify it's running:
 ```
 curl https://jules-mcp-xxxx.deno.dev/health
-# → {"status":"ok","server":"jules-mcp","version":"0.3.0"}
+# → {"status":"ok","server":"jules-mcp","version":"3.1.0"}
 ```
 
 ### Step 2 — Add the connector in Perplexity
@@ -210,23 +210,39 @@ curl -X POST http://localhost:8000/mcp \
 
 ## Available tools
 
-- `jules_list_sources`
-- `jules_get_source`
-- `jules_create_session`
-- `jules_list_sessions`
-- `jules_get_session`
-- `jules_delete_session`
-- `jules_list_activities`
-- `jules_send_message`
-- `jules_approve_plan`
-- `jules_get_skill`
-- `jules_wait_for_session`
-- `jules_get_session_state`
-- `jules_list_activities_filtered`
-- `jules_get_session_output`
-- `jules_health_check`
-- `jules_describe_error`
-- `jules_build_session_prompt`
+### Sources
+- `jules_list_sources`: List all GitHub repositories connected to Jules.
+- `jules_get_source`: Get full details for one Jules source (repository).
+
+### Sessions
+- `jules_create_session`: Create a new Jules AI coding session.
+- `jules_quick_session`: One-shot shortcut: pick a template + repo name substring and instantly create a session.
+- `jules_clone_session`: Clone an existing session into a new session.
+- `jules_list_sessions`: List your Jules sessions with pagination and optional compact mode.
+- `jules_list_sessions_by_state`: Filter sessions by one or more states.
+- `jules_get_session`: Get full details for a specific Jules session by ID.
+- `jules_get_session_state`: Lightweight check of a session's current state.
+
+### Monitoring
+- `jules_health_check`: Check Jules API connectivity and health.
+- `jules_session_summary`: Get a rich single-call summary of a session (state, activity, output links).
+- `jules_wait_for_session`: Poll a session until it reaches COMPLETED or FAILED.
+
+### Outputs
+- `jules_get_session_output`: Extract structured outputs (PR URLs, changed files) from a completed session.
+- `jules_list_pr_outputs`: Scan recent sessions and return only those that produced pull requests.
+
+### Activities
+- `jules_list_activities`: Check what Jules is doing (heartbeat or full timeline).
+- `jules_get_activity`: Get a single activity by its full resource name.
+
+### Lifecycle
+- `jules_send_message`: Send a follow-up instruction to a Jules session.
+- `jules_approve_plan`: Approve the plan Jules has proposed for a session.
+- `jules_delete_session`: Delete a Jules session permanently.
+- `jules_bulk_delete_sessions`: Delete multiple sessions by ID in parallel.
+- `jules_archive_session`: Archive a Jules session.
+- `jules_unarchive_session`: Unarchive a previously archived Jules session.
 
 ## Session creation UX conventions (important)
 
@@ -242,12 +258,7 @@ If `startingBranch` is omitted, the server now retries with sensible fallbacks (
 
 ## Source discovery UX
 
-`jules_list_sources.filter` supports two modes:
-
-- **AIP expression** (server-side): e.g. `name=sources/github/myorg/myrepo`
-- **Simple substring** (local fallback): e.g. `jules-mcp`
-
-If server-side filtering is rejected as `INVALID_ARGUMENT`, the server automatically falls back to local substring matching and returns a warning plus matched sources.
+`jules_list_sources.filter` supports simple substring matching. It checks the source name, ID, owner, and repository name for the provided string (case-insensitive).
 
 ## Efficient context controls (new)
 
@@ -270,40 +281,23 @@ Example strategy for efficiency:
 2. Pick one `sessionId`
 3. `jules_get_session` with only fields you need (e.g., `includeOutputs: true` only when reviewing a final patch)
 
-## Skill tool for new agents
-
-Use `jules_get_skill` to get tool + parameter guidance directly from the server.
-
-Parameters:
-
-- `toolName` (optional): return only one tool's details.
-- `compact` (optional): return purpose + required params only.
-- `includeExamples` (optional): include or omit example values.
-
-Common calls:
-
-- `{ "compact": true }`
-- `{ "toolName": "jules_create_session" }`
-- `{ "toolName": "jules_list_sessions", "includeExamples": false }`
-
-## Agent-Focused Workflows (v0.3.0+)
+## Agent-Focused Workflows
 
 This version extends Jules MCP with comprehensive agent-management capabilities. Agents can now handle complete development workflows without manual steps.
 
 ### New Tools for Agents
 
 **Session Lifecycle Management:**
-- `jules_wait_for_session` - Poll until session reaches terminal state
-- `jules_get_session_state` - Quick state check (lightweight)
-- `jules_list_activities_filtered` - Activities with type filtering
-- `jules_get_session_output` - Extract PRs and files from completed sessions
+- `jules_wait_for_session` — Poll until session reaches terminal state.
+- `jules_get_session_state` — Quick state check (lightweight).
+- `jules_session_summary` — Rich single-call session summary.
+- `jules_get_session_output` — Extract PRs and files from completed sessions.
 
 **Error Recovery & Observability:**
 - `jules_health_check` - Verify API connectivity before starting
-- `jules_describe_error` - Parse API errors into actionable guidance
 
 **Templates:**
-- `jules_build_session_prompt` - Pre-configured prompts for common tasks
+- `jules_quick_session` - One-shot creation from templates
 
 ### Complete Workflow Example
 
@@ -344,19 +338,17 @@ console.log('PR created:', outputs.pullRequests[0].url);
 
 **Session Creation**
 - Always start with `requirePlanApproval: true` to validate approach
-- Use `jules_build_session_prompt` for consistent templates
+- Use `jules_quick_session` for common tasks like bug fixes or tests
 - One task per session (atomicity)
 
 **Polling Strategy**
 - Use `timeoutSeconds=300` (5 min) for typical tasks
 - Increase to `600` (10 min) for large refactors
-- Use `pollIntervalMs=2000` (2 sec) for normal tasks, `5000` for quieter polling
+- Use `pollIntervalMs=3000` (3 sec) for normal tasks
 
 **Error Handling**
 - Call `jules_health_check` before creating sessions
-- Use `jules_describe_error` to parse failures
-- For `retryable: true` errors, implement exponential backoff
-- For `retryable: false` errors, fix input and retry
+- For transient errors, implement exponential backoff
 
 **Data Extraction**
 - Always extract `outputs` before deleting sessions
@@ -373,24 +365,23 @@ console.log('PR created:', outputs.pullRequests[0].url);
 | Error | Cause | Solution |
 |-------|-------|----------|
 | `Timeout waiting for session` | Task exceeds timeout | Increase `timeoutSeconds` or check session state manually |
-| `Invalid session ID format` | Bad session reference | Use `jules_list_sessions` to get valid IDs |
-| `Rate limited (429)` | API quota hit | Increase `pollIntervalMs` to 5-10 seconds |
+| `Rate limited (429)` | API quota hit | Increase `pollIntervalMs` |
 | `Unauthorized (401)` | Missing/invalid API key | Verify `JULES_API_KEY` environment variable |
 | `Source not found (404)` | Wrong repo format | Use `jules_list_sources` to find canonical source path |
 
 ## Version History
 
-### v0.3.0 (Current)
-- ✅ Complete Jules API coverage (17 tools)
-- ✅ Session polling and state management
-- ✅ Activity filtering
-- ✅ Error description and recovery helpers
-- ✅ Session templates for common flows
+### v3.1.0 (Current)
+- ✅ Expanded Jules API coverage (22 tools)
+- ✅ Logical tool grouping (Sources, Sessions, Monitoring, Outputs, Activities, Lifecycle)
+- ✅ One-shot `jules_quick_session` with built-in templates
+- ✅ Parallel `jules_bulk_delete_sessions`
+- ✅ Session archiving and unarchiving
+- ✅ Rich `jules_session_summary`
 - ✅ Agent-focused workflows and best practices
 - ✅ **Perplexity remote MCP connector** (HTTP/Deno entrypoint)
-- ✅ Zero breaking changes to existing stdio/local usage
 
-### v0.2.0
+### v0.3.0
 - 10 core Jules API tools
 - Compact response modes
 - Skill guidance tool
