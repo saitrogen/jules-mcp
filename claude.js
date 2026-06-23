@@ -24,7 +24,7 @@
  */
 
 const SERVER_NAME    = "jules-mcp";
-const SERVER_VERSION = "3.1.0";
+const SERVER_VERSION = "3.2.0";
 const PROTO_V        = "2025-03-26";
 const JULES_BASE     = "https://jules.googleapis.com/v1alpha";
 
@@ -217,7 +217,7 @@ const TOOLS = [
   },
   {
     name: "jules_session_summary",
-    description: "Get a rich single-call summary of a session: state, activity count, latest agent message, and output links.",
+    description: "Get a rich single-call summary of a session: title, state, repo, branch, duration, prompt snippet, last action, step count, and any PRs/commits produced.",
     inputSchema: {
       type: "object",
       properties: { sessionId: { type: "string", description: "Session identifier" } },
@@ -226,7 +226,7 @@ const TOOLS = [
   },
   {
     name: "jules_wait_for_session",
-    description: "Poll a session until it reaches COMPLETED or FAILED. Returns the final session object. Use for automating workflows after session creation.",
+    description: "Poll a session until it reaches COMPLETED or FAILED. Returns the final session object. NOTE: long waits may exceed the MCP client's per-request timeout — for waits beyond ~1 min, prefer polling jules_get_session_state yourself.",
     inputSchema: {
       type: "object",
       properties: {
