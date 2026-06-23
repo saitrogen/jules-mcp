@@ -9,7 +9,8 @@
     "dev": "deno run --allow-net --allow-env --watch perplexity.js",
     "start:local": "deno run --allow-net --allow-env http.js",
     "start:claude": "deno run --allow-net --allow-env claude.js",
-    "dev:claude": "deno run --allow-net --allow-env --watch claude.js"
+    "dev:claude": "deno run --allow-net --allow-env --watch claude.js",
+    "test": "deno test --allow-env test/"
   },
   "lint": {
     "rules": {
